@@ -35,6 +35,13 @@ WHEEL_WIDTH = 0.225    # m
 TOTAL_MASS = 1500.0    # kg (held in base_link; wheels are 0.1 kg dummies)
 COG_Z_DEFAULT = 0.55   # m, base_link origin height at static ride height
 
+# Steering: front-tire angle limit (URDF revolute joint) and column-side
+# overall gear ratio. `pinion_max = DELTA_MAX_RAD * STEERING_RATIO`.
+# Phase 2 uses FixedRatioSteeringModel(STEERING_RATIO); a nonlinear /
+# variable-ratio map can be substituted later (Phase 4+).
+DELTA_MAX_RAD = 0.611  # rad, ~35 deg, matches URDF steer joint limit
+STEERING_RATIO = 16.0  # dimensionless, typical passenger car (14--18)
+
 
 SEDAN_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(

@@ -1,116 +1,216 @@
-"""Vehicle dynamics metrics shared by Phase 1 sanity, Phase 2 baseline, Phase 3 RL eval.
+"""Trajectory metrics shared by Phase 2 baseline and Phase 3 RL evaluation.
 
-Implementing once and reusing keeps Phase 2 vs Phase 3 comparisons apples-to-apples.
+Two layers:
+
+- `ProgressAccumulator` is a streaming, per-env arc-length progress tracker
+  that runs inside the rollout loop. It owns the wrap correction and the
+  per-step delta cap, so completion / on-track-progress stay honest even
+  when the projection foot jumps near self-intersections or off-track
+  excursions.
+
+- `TrajectoryMetrics` (dataclass) + `summarize_trajectory(...)` produce the
+  7-metric Phase 2 sanity report from per-step time-series. Phase 3 uses
+  the same definitions per env, so RL-vs-baseline comparisons are
+  apples-to-apples.
+
+Keys in `TrajectoryMetrics` match the JSON output of `run_classical.py`.
 """
 from __future__ import annotations
 
-import csv
 import json
-import math
 import os
 from dataclasses import asdict, dataclass
+
+import numpy as np
+import torch
+from torch import Tensor
 
 
 @dataclass
 class TrajectoryMetrics:
-    """Summary metrics for a single rollout against a reference path."""
-    rms_lateral_error: float = 0.0
-    max_lateral_error: float = 0.0
+    """Per-rollout trajectory summary (single env)."""
+    duration_sec: float = 0.0
+    n_steps: int = 0
+    rms_lateral_error_m: float = 0.0
+    max_lateral_error_m: float = 0.0
     completion_rate: float = 0.0
-    mean_speed_error: float = 0.0
-    max_yaw_rate: float = 0.0
-    max_roll_angle: float = 0.0
-    max_pitch_angle: float = 0.0
-    off_track_time: float = 0.0
-    n_samples: int = 0
-    duration: float = 0.0
+    on_track_progress_rate: float = 0.0
+    traveled_arc_m: float = 0.0
+    course_length_m: float = 0.0
+    mean_speed_error_mps: float = 0.0
+    max_yaw_rate_rad_s: float = 0.0
+    max_roll_angle_deg: float = 0.0
+    off_track_time_sec: float = 0.0
+    off_track_threshold_m: float = 1.0
 
 
-def quat_to_euler_xyz(qw: float, qx: float, qy: float, qz: float) -> tuple[float, float, float]:
-    """Quaternion (w, x, y, z) → roll, pitch, yaw (radians, ZYX intrinsic)."""
-    # roll (X)
-    sinr_cosp = 2 * (qw * qx + qy * qz)
-    cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
-    # pitch (Y)
-    sinp = 2 * (qw * qy - qz * qx)
-    pitch = math.copysign(math.pi / 2, sinp) if abs(sinp) >= 1 else math.asin(sinp)
-    # yaw (Z)
-    siny_cosp = 2 * (qw * qz + qx * qy)
-    cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-    return roll, pitch, yaw
+class ProgressAccumulator:
+    """Streaming arc-length-progress tracker (per env).
 
+    Each step:
+      delta_s = s_proj_curr - s_proj_prev
+      if loop:                                 # wrap correction
+          delta_s += L if delta_s < -L/2
+          delta_s -= L if delta_s >  L/2
+      cap     = max(ds * cap_baseline_ds_factor,
+                    |vx| * dt * cap_velocity_factor)
+      delta_s = clamp(delta_s, -cap, +cap)     # filter argmin glitches
+      forward = max(delta_s, 0)                # ignore retreats
+      traveled += forward
+      on_track += forward * (|lat| <= threshold)
 
-def metrics_from_csv(csv_path: str, target_speed: float | None = None,
-                     reference_path: list[tuple[float, float]] | None = None,
-                     off_track_threshold: float = 1.0) -> TrajectoryMetrics:
-    """Compute summary metrics from a per-step CSV (t, x, y, z, qw, qx, qy, qz, vx_world, vy_world, wz_world)."""
-    rows: list[dict[str, float]] = []
-    with open(csv_path, "r") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            rows.append({k: float(v) for k, v in r.items()})
-    if not rows:
-        return TrajectoryMetrics()
+    The cap is per-element so each env clamps with its own current speed.
+    """
 
-    t = [r["t"] for r in rows]
-    duration = t[-1] - t[0]
-    n = len(rows)
-    out = TrajectoryMetrics(n_samples=n, duration=duration)
+    def __init__(
+        self,
+        num_envs: int,
+        *,
+        total_length: float,
+        ds: float,
+        dt: float,
+        is_loop: bool,
+        device: torch.device | str = "cpu",
+        off_track_threshold: float = 1.0,
+        cap_velocity_factor: float = 2.0,
+        cap_baseline_ds_factor: float = 2.0,
+    ):
+        if total_length <= 0.0:
+            raise ValueError(f"total_length must be positive, got {total_length}")
+        self.num_envs = num_envs
+        self.L_total = float(total_length)
+        self.ds = float(ds)
+        self.dt = float(dt)
+        self.is_loop = bool(is_loop)
+        self.off_track_threshold = float(off_track_threshold)
+        self._cap_v = float(cap_velocity_factor)
+        self._cap_ds = float(cap_baseline_ds_factor)
+        self.device = torch.device(device)
 
-    rolls, pitches, yaws = [], [], []
-    speeds = []
-    yaw_rates = []
-    for r in rows:
-        roll, pitch, yaw = quat_to_euler_xyz(r["qw"], r["qx"], r["qy"], r["qz"])
-        rolls.append(roll); pitches.append(pitch); yaws.append(yaw)
-        speeds.append(math.hypot(r["vx_world"], r["vy_world"]))
-        yaw_rates.append(abs(r["wz_world"]))
-    out.max_yaw_rate = max(yaw_rates)
-    out.max_roll_angle = max(abs(r) for r in rolls)
-    out.max_pitch_angle = max(abs(p) for p in pitches)
+        self._has_prev = False
+        self._s_prev = torch.zeros(num_envs, device=self.device)
+        self._traveled = torch.zeros(num_envs, device=self.device)
+        self._on_track = torch.zeros(num_envs, device=self.device)
 
-    if target_speed is not None:
-        out.mean_speed_error = sum(abs(s - target_speed) for s in speeds) / n
+    def update(self, s_proj: Tensor, vx: Tensor, lat_err: Tensor) -> None:
+        """Accumulate one step of progress for all envs.
 
-    if reference_path is not None and len(reference_path) >= 2:
-        lat_errs = []
-        for r in rows:
-            lat_errs.append(_lateral_error(r["x"], r["y"], reference_path))
-        out.rms_lateral_error = math.sqrt(sum(e * e for e in lat_errs) / n)
-        out.max_lateral_error = max(lat_errs)
-        # Completion = reached final waypoint within tolerance (3 m)
-        last_wp = reference_path[-1]
-        final_dist = math.hypot(rows[-1]["x"] - last_wp[0], rows[-1]["y"] - last_wp[1])
-        out.completion_rate = 1.0 if final_dist < 3.0 else 0.0
-        # Off-track time = sum of dt where |lat| > threshold
-        if len(t) > 1:
-            dt = (t[-1] - t[0]) / (n - 1)
-            out.off_track_time = sum(dt for e in lat_errs if e > off_track_threshold)
-    return out
+        Inputs are (N,) tensors aligned with `num_envs`. The first call only
+        records `s_prev` and skips accumulation (no prior sample to diff
+        against), so over T steps the accumulator integrates T-1 deltas.
+        """
+        if not self._has_prev:
+            self._s_prev = s_proj.detach().clone()
+            self._has_prev = True
+            return
 
+        delta = s_proj - self._s_prev
+        if self.is_loop:
+            half = self.L_total / 2.0
+            delta = torch.where(delta < -half, delta + self.L_total, delta)
+            delta = torch.where(delta >  half, delta - self.L_total, delta)
+        cap = torch.clamp(vx.abs() * self.dt * self._cap_v,
+                          min=self.ds * self._cap_ds)
+        delta = torch.maximum(-cap, torch.minimum(cap, delta))
+        forward = torch.clamp(delta, min=0.0)
+        self._traveled = self._traveled + forward
+        on_track_mask = lat_err.abs() <= self.off_track_threshold
+        self._on_track = self._on_track + forward * on_track_mask.to(forward.dtype)
+        self._s_prev = s_proj.detach().clone()
 
-def _lateral_error(x: float, y: float, path: list[tuple[float, float]]) -> float:
-    """Minimum perpendicular distance to a polyline."""
-    best = float("inf")
-    for i in range(len(path) - 1):
-        x1, y1 = path[i]
-        x2, y2 = path[i + 1]
-        dx, dy = x2 - x1, y2 - y1
-        seg2 = dx * dx + dy * dy
-        if seg2 < 1e-12:
-            d = math.hypot(x - x1, y - y1)
+    def reset(self, env_ids: Tensor | None = None) -> None:
+        """Restart accumulation. Partial reset zeros only `env_ids`."""
+        if env_ids is None:
+            self._has_prev = False
+            self._traveled.zero_()
+            self._on_track.zero_()
+            self._s_prev.zero_()
         else:
-            t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / seg2))
-            px, py = x1 + t * dx, y1 + t * dy
-            d = math.hypot(x - px, y - py)
-        if d < best:
-            best = d
-    return best
+            # Per-env "has_prev" is not tracked; the first post-reset update()
+            # for these envs will diff against the old s_prev (now zero) and
+            # might log one spurious clamped delta. For Phase 3 RL with
+            # ~hundreds of steps per episode this is a sub-percent effect.
+            self._traveled[env_ids] = 0.0
+            self._on_track[env_ids] = 0.0
+            self._s_prev[env_ids] = 0.0
+
+    @property
+    def traveled_arc(self) -> Tensor:
+        """(N,) cumulative forward arc-length along the path [m]."""
+        return self._traveled
+
+    @property
+    def on_track_arc(self) -> Tensor:
+        """(N,) cumulative forward arc-length while |lat| <= threshold [m]."""
+        return self._on_track
+
+    def completion_rate(self) -> Tensor:
+        """(N,) traveled_arc / course_length, clamped to [0, 1]."""
+        return torch.clamp(self._traveled / self.L_total, max=1.0)
+
+    def on_track_progress_rate(self) -> Tensor:
+        """(N,) on_track_arc / course_length, clamped to [0, 1]."""
+        return torch.clamp(self._on_track / self.L_total, max=1.0)
 
 
-def write_metrics_json(metrics: TrajectoryMetrics, out_path: str) -> None:
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+def summarize_trajectory(
+    *,
+    lat_err_m: np.ndarray,         # (T,) m
+    vx_mps: np.ndarray,            # (T,) m/s, body-frame
+    yaw_rate_rad_s: np.ndarray,    # (T,) rad/s
+    roll_deg: np.ndarray,          # (T,) deg (matches CSV log convention)
+    dt: float,
+    target_speed: float,
+    traveled_arc: float,
+    on_track_arc: float,
+    course_length: float,
+    off_track_threshold: float = 1.0,
+) -> TrajectoryMetrics:
+    """Compute Phase 2's 7 metrics from per-step time-series + progress totals.
+
+    Phase 2 callers feed CSV columns directly. Phase 3 callers can apply
+    this per env after a vectorized rollout (slice (T, N) tensors per env).
+
+    `traveled_arc` and `on_track_arc` come from `ProgressAccumulator` (or
+    equivalent post-hoc computation); they cannot be recovered from the
+    time-series alone because of the per-step glitch cap.
+    """
+    n = int(lat_err_m.shape[0])
+    if n == 0:
+        return TrajectoryMetrics(course_length_m=float(course_length),
+                                 off_track_threshold_m=float(off_track_threshold))
+    if course_length <= 0.0:
+        raise ValueError(f"course_length must be positive, got {course_length}")
+
+    abs_lat = np.abs(lat_err_m)
+    return TrajectoryMetrics(
+        duration_sec=float(n) * float(dt),
+        n_steps=n,
+        rms_lateral_error_m=float(np.sqrt(np.mean(lat_err_m ** 2))),
+        max_lateral_error_m=float(abs_lat.max()),
+        completion_rate=float(min(1.0, traveled_arc / course_length)),
+        on_track_progress_rate=float(min(1.0, on_track_arc / course_length)),
+        traveled_arc_m=float(traveled_arc),
+        course_length_m=float(course_length),
+        mean_speed_error_mps=float(np.mean(vx_mps - target_speed)),
+        max_yaw_rate_rad_s=float(np.abs(yaw_rate_rad_s).max()),
+        max_roll_angle_deg=float(np.abs(roll_deg).max()),
+        off_track_time_sec=float(((abs_lat > off_track_threshold) * dt).sum()),
+        off_track_threshold_m=float(off_track_threshold),
+    )
+
+
+def write_metrics_json(
+    metrics: TrajectoryMetrics,
+    out_path: str,
+    **extra: object,
+) -> None:
+    """Write `metrics` as JSON to `out_path`, merging caller-supplied extras
+    (run identifiers like course / mu / target_speed) at the top level.
+    """
+    payload = {**asdict(metrics), **extra}
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(out_path, "w") as f:
-        json.dump(asdict(metrics), f, indent=2)
+        json.dump(payload, f, indent=2)

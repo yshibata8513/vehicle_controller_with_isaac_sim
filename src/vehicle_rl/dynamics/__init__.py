@@ -15,6 +15,7 @@ from .normal_load import NormalLoadModel, StaticNormalLoadModel
 from .tire_force import TireForceModel, LinearFrictionCircleTire
 from .attitude_damper import AttitudeDamper
 from .injector import aggregate_tire_forces_to_base_link
+from .steering import SteeringModel, FixedRatioSteeringModel
 
 __all__ = [
     "VehicleState",
@@ -27,4 +28,6 @@ __all__ = [
     "LinearFrictionCircleTire",
     "AttitudeDamper",
     "aggregate_tire_forces_to_base_link",
+    "SteeringModel",
+    "FixedRatioSteeringModel",
 ]

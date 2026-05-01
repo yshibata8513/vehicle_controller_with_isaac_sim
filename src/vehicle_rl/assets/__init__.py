@@ -8,4 +8,6 @@ from .sedan import (
     WHEEL_WIDTH,
     TOTAL_MASS,
     COG_Z_DEFAULT,
+    DELTA_MAX_RAD,
+    STEERING_RATIO,
 )
