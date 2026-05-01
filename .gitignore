@@ -1,0 +1,28 @@
+# Generated artefacts and run results (not committed)
+videos/
+logs/
+outputs/
+metrics/
+
+# URDF -> USD conversion output (regenerate via scripts/sim/convert_sedan_urdf.py)
+assets/usd/
+
+# Legacy snapshot (case-A, deprecated; kept locally only)
+legacy/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / tools
+.vscode/
+.idea/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
