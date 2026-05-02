@@ -610,10 +610,10 @@ $PY scripts/sim/smoke_simulator.py --headless
 
   **観測**（`VehicleObservation` をそのまま flatten）:
   - IMU: `vx, yaw_rate, ax, ay, roll, pitch` （**`vy` は計測不能のため非含有**、`VehicleStateGT` でのみ保持）
-  - GPS: `pos_xy, yaw`
   - ステアリングコラム: `pinion_angle`（タイヤ角ではない、観測可能量）
   - Path errors: `lateral_error, heading_error`（planner が射影時に一括計算）
   - Lookahead: `Plan.x[:K], Plan.y[:K], Plan.v[:K]` body-frame
+  - **絶対 pose（`pos_xy, yaw`）は観測に入れない**: 実車 GPS では取れる量だが、policy に渡すと「この座標ではこう操舵」という暗記が起きやすく、random reset / multi-course / DR への汎化を阻害する。`heading_error` + body-frame plan + `lateral_error` で経路相対性が完結する。`VehicleStateGT` には残し、reset / 終了判定 / メトリクスでのみ使う（`docs/phase3_training_review.md` 項目 7）
   - μ は観測に**入れない**（頑健性訓練）。オラクル比較で「μ 真値を入れた policy」を 1 本別途学習し性能上限を測る
 
   **行動**（`VehicleAction`）: `pinion_target ∈ [-9.78, +9.78] rad`, `a_x_target ∈ [-5.0, +3.0] m/s²`。アクチュエータ一次遅れ + ステア固定ギア比を経て `delta_actual, a_x_actual` になる
@@ -629,7 +629,7 @@ $PY scripts/sim/smoke_simulator.py --headless
   **ドメインランダマイゼーション (events)**:
   - **`μ ∈ [0.3, 1.0]`** を `vsim.mu = ...` で per-env per-tire テンソル化して env reset 時に書き換え
   - 車重 ±15%、CoG 高さ ±0.1 m（Phase 1.5 の `TOTAL_MASS`, `H_CG` を per-env テンソル化）
-  - IMU / GPS ノイズ: `NoiseCfg` の per-channel σ を per-env Tensor 化（現在は scalar）
+  - IMU ノイズ: `NoiseCfg` の per-channel σ を per-env Tensor 化（現在は scalar）。GPS は観測非含有のためノイズ注入不要
   - **アクチュエータ時定数** `τ_steer ±30%`, `τ_drive ±30%`（`FirstOrderLagActuator.tau_pos/neg` を per-env テンソル化）
   - エピソード毎にコース種類をサンプリング: 4 つの Path を構築し、env_id で切替
 

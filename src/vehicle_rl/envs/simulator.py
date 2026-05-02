@@ -240,7 +240,35 @@ class VehicleSimulator:
         return self._build_state_gt_from_cache()
 
     def step(self, action: VehicleAction) -> VehicleStateGT:
-        """Advance physics by one sim_dt with the given action."""
+        """Advance physics by one sim_dt with the given action.
+
+        Phase 2 / standalone scripts call this. Phase 3 RL env uses
+        `apply_action_to_physx()` instead so the DirectRLEnv outer loop
+        owns sim.step / scene.update (decimation handling).
+        """
+        self.apply_action_to_physx(action)
+        self.sedan.write_data_to_sim()
+        self.sim.step()
+        self.sedan.update(self.dt)
+        return self._build_state_gt_from_cache()
+
+    def apply_action_to_physx(self, action: VehicleAction) -> None:
+        """Compute tire forces from the action and write them to PhysX
+        buffers (external force/torque + steer joint target). Does NOT
+        advance the sim or refresh `sedan.data`.
+
+        Intended for `DirectRLEnv._apply_action`, which is called once per
+        physics substep inside the env-step decimation loop. The cache
+        (`self._Fz / _Fx / _Fy / _slip_angle / _ax_body / _ay_body`) is
+        updated here so a subsequent `_build_state_gt_from_cache()` returns
+        forces consistent with the PhysX state read after the next
+        `sim.step()`.
+
+        Numerically identical to the body of `step()` minus the three
+        sim-stepping calls; bit-equivalence is preserved for the Phase 2
+        smoke regression test (forces are computed from pre-step state in
+        both code paths).
+        """
         # 1) Actuator first-order lag (Python-side)
         pinion_actual = self.steer_act.step(action.pinion_target, self.dt)
         a_x_actual = self.drive_act.step(action.a_x_target, self.dt)
@@ -269,28 +297,27 @@ class VehicleSimulator:
         steer_target = torch.stack([delta_actual, delta_actual], dim=-1)   # (N, 2)
         self.sedan.set_joint_position_target(steer_target, joint_ids=self.joints.steer_ids)
 
-        # 6) Update centripetal feedback before stepping (uses pre-step values,
-        #    matching the Phase 1.5 reference implementation)
+        # 6) Update centripetal feedback (uses pre-step values, matching the
+        #    Phase 1.5 reference implementation)
         v_long = veh_state.vel_body[..., 0]
         wz = veh_state.angvel_body[..., 2]
         self._a_y_estimate = wz * v_long
 
-        # 7) Advance the simulator
-        self.sedan.write_data_to_sim()
-        self.sim.step()
-        self.sedan.update(self.dt)
-
-        # 8) Refresh cached force/accel and build GT state from the post-step
-        # pose + this step's force computations. Body-frame accel approximates
-        # IMU specific-force readings; for small roll/pitch (Phase 1.5
-        # satisfies this) gravity nearly cancels Fz so F_body[..., :2] / m is
-        # a faithful IMU-side ax/ay.
+        # 7) Cache forces/accel for the next state_gt build. Body-frame
+        # accel approximates IMU specific-force; for small roll/pitch
+        # (Phase 1.5 satisfies this) gravity nearly cancels Fz so
+        # F_body[..., :2] / m is a faithful IMU-side ax/ay.
         self._Fz = Fz
         self._Fx = Fx
         self._Fy = Fy
         self._slip_angle = slip_angle
         self._ax_body = F_body[..., 0] / self._mass
         self._ay_body = F_body[..., 1] / self._mass
+
+    def get_state(self) -> VehicleStateGT:
+        """Return current `VehicleStateGT` from cached forces + post-step
+        PhysX pose. Use after `apply_action_to_physx()` + sim has advanced.
+        """
         return self._build_state_gt_from_cache()
 
     # ------------------------------------------------------------------

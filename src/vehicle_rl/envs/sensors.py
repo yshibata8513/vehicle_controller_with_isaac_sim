@@ -38,9 +38,12 @@ class NoiseCfg:
     Each field is a scalar standard deviation; None disables that channel.
     Phase 2 default = no noise (controllers operate on clean GT). Phase 3
     domain-randomization will instantiate non-None values.
+
+    No `pos_xy_std` / `yaw_std`: world-frame absolute pose is not part of
+    `VehicleObservation` (see types.py). It would still be measurable on
+    a real car (GPS), but the policy doesn't see it, so injecting noise
+    has no effect.
     """
-    pos_xy_std: float | None = None      # m
-    yaw_std: float | None = None         # rad
     vx_std: float | None = None          # m/s
     ax_std: float | None = None          # m/s^2
     ay_std: float | None = None          # m/s^2
@@ -70,8 +73,11 @@ def build_observation(
     projection (e.g., `Path.project(pos_xy, yaw, K)`), not recomputed here.
 
     Hidden from the policy: tire angle (`delta_actual`), lateral velocity
-    (`vy = vel_body[:, 1]`), per-wheel quantities, mu, and actuator
-    longitudinal internal (`a_x_actual`).
+    (`vy = vel_body[:, 1]`), per-wheel quantities, mu, actuator
+    longitudinal internal (`a_x_actual`), and **world-frame absolute pose**
+    (`pos_xy`, `yaw`). Absolute pose lives only on `VehicleStateGT`; the
+    policy operates on path-relative quantities (lateral / heading error +
+    body-frame plan window) for translation/rotation invariance.
     """
     if noise is None:
         noise = NoiseCfg()
@@ -84,9 +90,6 @@ def build_observation(
         ay=_add_noise(state_gt.ay_body, noise.ay_std),
         roll=_add_noise(state_gt.rpy[:, 0], noise.roll_std),
         pitch=_add_noise(state_gt.rpy[:, 1], noise.pitch_std),
-        # GPS
-        pos_xy=_add_noise(state_gt.pos_xyz[:, :2], noise.pos_xy_std),
-        yaw=_add_noise(state_gt.rpy[:, 2], noise.yaw_std),
         # Steering column encoder
         pinion_angle=_add_noise(state_gt.pinion_actual, noise.pinion_std),
         # Path-following errors (computed by the planner; passed through)

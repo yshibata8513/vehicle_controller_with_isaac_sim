@@ -4,10 +4,18 @@ controllers: Pure Pursuit + PID) and Phase 3 (RL).
 Conventions:
 - N is the number of parallel envs (single-env Phase 2 uses N=1).
 - All wheel-indexed tensors are ordered [FL, FR, RL, RR].
-- `VehicleObservation` contains only signals an instrumented passenger car
-  can plausibly measure: IMU, GPS, steering-column encoder, planner output.
-  The front-tire steering angle (`delta_actual`) and lateral velocity (`vy`)
-  are NOT observable on a real car -- they live in `VehicleStateGT` only.
+- `VehicleObservation` contains only **path-relative** signals: IMU,
+  steering-column encoder, lateral/heading error vs the path, and a
+  body-frame lookahead window. World-frame absolute pose (`pos_xy`, `yaw`)
+  is intentionally excluded -- a real instrumented car has GPS, but for
+  controller / policy design we want translation/rotation-invariant
+  inputs so the same policy generalizes across courses, env-origin
+  offsets, and (Phase 3 DR) randomized course placements. The absolute
+  pose remains available on `VehicleStateGT` for metrics, reset logic,
+  and termination checks. See docs/phase3_training_review.md item 7.
+- The front-tire steering angle (`delta_actual`) and lateral velocity
+  (`vy`) are NOT observable on a real car -- they live in
+  `VehicleStateGT` only.
 - `VehicleStateGT` is the simulator-side ground truth, used only for
   evaluation metrics and as input to the dynamics modules. Never pass GT
   fields to a controller / policy.
@@ -32,7 +40,7 @@ A_X_TARGET_MAX = +3.0   # m/s^2 (moderate accel; matches PLAN.md Phase 3)
 
 @dataclass
 class VehicleObservation:
-    """What a controller / RL policy is allowed to see."""
+    """What a controller / RL policy is allowed to see (path-relative only)."""
 
     # IMU
     vx: Tensor          # (N,) body-frame longitudinal velocity [m/s]
@@ -41,10 +49,6 @@ class VehicleObservation:
     ay: Tensor          # (N,) body-frame lateral accel [m/s^2]
     roll: Tensor        # (N,) [rad]
     pitch: Tensor       # (N,) [rad]
-
-    # GPS-like
-    pos_xy: Tensor      # (N, 2) world-frame [m]
-    yaw: Tensor         # (N,) world-frame [rad]
 
     # Steering-column encoder. Post-actuator (first-order lag output),
     # before the SteeringModel; NOT the front-tire angle.
@@ -74,11 +78,20 @@ class VehicleStateGT:
 
     Used for: (a) evaluation metrics, (b) input to dynamics modules
     (`StaticNormalLoadModel`, `LinearFrictionCircleTire`, `injector`),
-    (c) generating `VehicleObservation` via `envs.sensors.build_observation`.
+    (c) generating `VehicleObservation` via `envs.sensors.build_observation`,
+    (d) reset / termination logic that needs world-frame pose.
 
-    Includes IMU/GPS-equivalent signals (also exposed via Observation) plus
-    fields not observable on a real car (tire angle, lateral velocity, mu,
-    per-wheel forces).
+    Three groups of signals coexist here:
+      - IMU-equivalent (vx, yaw_rate, ax, ay, roll, pitch): the policy-visible
+        subset is mirrored into `VehicleObservation`.
+      - GPS-equivalent absolute pose (`pos_xyz`, `quat_wxyz`, world `yaw`):
+        kept here for metrics / reset / termination but **intentionally
+        hidden from the policy** -- the observation uses path-relative
+        signals only (`lateral_error`, `heading_error`, body-frame plan)
+        so the policy generalizes across courses and randomized origins.
+        See module docstring + docs/phase3_training_review.md item 7.
+      - Not-observable-on-a-real-car (tire angle, vy, mu, per-wheel forces):
+        physics internals exposed for diagnostics, never on observation.
     """
 
     # World-frame pose / motion

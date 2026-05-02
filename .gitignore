@@ -1,6 +1,7 @@
 # Generated artefacts and run results (not committed)
 videos/
 logs/
+logs_*.txt
 outputs/
 metrics/
 
