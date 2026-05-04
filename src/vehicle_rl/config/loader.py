@@ -141,6 +141,29 @@ def resolve_refs(
     return data
 
 
+def _assert_no_ref_in_subtree(
+    value: Any, path: tuple[str, ...] = ()
+) -> None:
+    """Raise ValueError if any `*_ref` key appears anywhere in `value`.
+
+    Walks dicts and lists recursively. Refs are structural and may only appear
+    in the experiment composition root, never inside `overrides:` (regardless
+    of nesting depth or whether the ref-bearing subtree wholesale-replaces a
+    non-mapping target during deep-merge).
+    """
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if isinstance(k, str) and k.endswith(REF_SUFFIX) and k != REF_SUFFIX:
+                full = ".".join(path + (str(k),)) if (path or k) else "<root>"
+                raise ValueError(
+                    f"override forbids ref keys: {full}"
+                )
+            _assert_no_ref_in_subtree(v, path=path + (str(k),))
+    elif isinstance(value, list):
+        for idx, item in enumerate(value):
+            _assert_no_ref_in_subtree(item, path=path + (f"[{idx}]",))
+
+
 def deep_merge_overrides(
     base: dict[str, Any],
     overrides: dict[str, Any],
@@ -152,8 +175,10 @@ def deep_merge_overrides(
     Strict rules:
     - Every key in `overrides` must exist in `base`. Unknown -> ValueError.
     - Lists are replaced wholesale (no element-wise merge).
-    - `<name>_ref` keys in overrides -> ValueError. Refs are structural and
-      must be set in the experiment composition root, not via override.
+    - `<name>_ref` keys anywhere in overrides (including inside dict values
+      that wholesale-replace a non-mapping target) -> ValueError. Refs are
+      structural and must be set in the experiment composition root, not via
+      override.
     """
     if not isinstance(overrides, dict):
         loc = ".".join(path) if path else "<root>"
@@ -166,13 +191,15 @@ def deep_merge_overrides(
             f"override target at {loc} must be a mapping, got {type(base).__name__}"
         )
 
+    # Reject *_ref anywhere in the override subtree before merging. This is the
+    # single place this check lives; the recursive merge call below does not
+    # repeat the walk (it would re-walk the same subtree quadratically).
+    if not path:
+        _assert_no_ref_in_subtree(overrides, path=path)
+
     out = dict(base)
     for key, value in overrides.items():
         full_path = path + (str(key),)
-        if isinstance(key, str) and key.endswith(REF_SUFFIX) and key != REF_SUFFIX:
-            raise ValueError(
-                f"override forbids ref keys: {'.'.join(full_path)}"
-            )
         if key not in out:
             raise ValueError(
                 f"override unknown key: {'.'.join(full_path)} "

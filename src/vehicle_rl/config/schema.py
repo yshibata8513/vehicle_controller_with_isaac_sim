@@ -100,12 +100,54 @@ class EnvSchema:
     diagnostics: dict
 
 
+# Per-shape controller schemas. Each `type` discriminator selects exactly one.
+# These match the YAMLs committed in PR 1 (configs/controllers/*.yaml) field
+# for field; validate_keys() will raise on any drift.
+
+
 @dataclass
-class ControllerSchema:
+class SpeedPIControllerSchema:
     schema_version: int
-    type: str
-    # Remaining fields are type-specific (kp/ki for speed_pi, lookahead_* for
-    # pure_pursuit). Validated in the controller adapter, not here.
+    type: str  # discriminator value: "speed_pi"
+    kp: float
+    ki: float
+    integral_max: float
+
+
+@dataclass
+class PurePursuitControllerSchema:
+    schema_version: int
+    type: str  # discriminator value: "pure_pursuit"
+    lookahead_min_m: float
+    lookahead_gain_s: float
+    lookahead_ds_m: float
+
+
+_CONTROLLER_SCHEMAS_BY_TYPE: dict[str, type] = {
+    "speed_pi": SpeedPIControllerSchema,
+    "pure_pursuit": PurePursuitControllerSchema,
+}
+
+
+def select_controller_schema(controller_bundle: dict) -> type:
+    """Pick the controller schema class based on the `type` discriminator.
+
+    Raises ValueError if the bundle has no `type` field or an unknown value.
+    The returned class can be passed to `validate_keys`.
+    """
+    if not isinstance(controller_bundle, dict):
+        raise ValueError(
+            f"controller bundle must be a mapping, got {type(controller_bundle).__name__}"
+        )
+    if "type" not in controller_bundle:
+        raise ValueError("controller bundle is missing 'type' discriminator")
+    type_value = controller_bundle["type"]
+    if type_value not in _CONTROLLER_SCHEMAS_BY_TYPE:
+        raise ValueError(
+            f"unknown controller type: {type_value!r} "
+            f"(known: {sorted(_CONTROLLER_SCHEMAS_BY_TYPE)})"
+        )
+    return _CONTROLLER_SCHEMAS_BY_TYPE[type_value]
 
 
 @dataclass
@@ -116,10 +158,15 @@ class AgentSchema:
     algorithm: dict
 
 
+# Per-shape experiment schemas. The PR 1 RL and classical experiment YAMLs
+# differ in which category refs they carry (RL has env/agent; classical has
+# controllers/run instead), so they need separate top-level shells.
+
+
 @dataclass
-class ExperimentSchema:
+class RLExperimentSchema:
     schema_version: int
-    kind: str
+    kind: str  # discriminator value: "rl_train"
     seed: Any
     run_name: str
     vehicle: dict
@@ -131,12 +178,57 @@ class ExperimentSchema:
     # `overrides` is consumed by the loader before validation.
 
 
+@dataclass
+class ClassicalExperimentSchema:
+    schema_version: int
+    kind: str  # discriminator value: "classical"
+    seed: Any
+    run_name: str
+    vehicle: dict
+    dynamics: dict
+    course: dict
+    controllers: dict
+    runtime: dict
+    run: dict
+    # `overrides` is consumed by the loader before validation.
+
+
+_EXPERIMENT_SCHEMAS_BY_KIND: dict[str, type] = {
+    "rl_train": RLExperimentSchema,
+    "classical": ClassicalExperimentSchema,
+}
+
+
+def select_experiment_schema(experiment_bundle: dict) -> type:
+    """Pick the experiment schema class based on the `kind` discriminator.
+
+    Raises ValueError if the bundle has no `kind` field or an unknown value.
+    """
+    if not isinstance(experiment_bundle, dict):
+        raise ValueError(
+            f"experiment bundle must be a mapping, got {type(experiment_bundle).__name__}"
+        )
+    if "kind" not in experiment_bundle:
+        raise ValueError("experiment bundle is missing 'kind' discriminator")
+    kind_value = experiment_bundle["kind"]
+    if kind_value not in _EXPERIMENT_SCHEMAS_BY_KIND:
+        raise ValueError(
+            f"unknown experiment kind: {kind_value!r} "
+            f"(known: {sorted(_EXPERIMENT_SCHEMAS_BY_KIND)})"
+        )
+    return _EXPERIMENT_SCHEMAS_BY_KIND[kind_value]
+
+
 __all__ = [
     "AgentSchema",
-    "ControllerSchema",
+    "ClassicalExperimentSchema",
     "DynamicsSchema",
     "EnvSchema",
-    "ExperimentSchema",
+    "PurePursuitControllerSchema",
+    "RLExperimentSchema",
+    "SpeedPIControllerSchema",
     "VehicleSchema",
+    "select_controller_schema",
+    "select_experiment_schema",
     "validate_keys",
 ]
