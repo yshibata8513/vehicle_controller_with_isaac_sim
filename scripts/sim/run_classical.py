@@ -1,7 +1,8 @@
 """Phase 2 classical baseline driver: Pure Pursuit + PI on speed.
 
 Pipeline per step:
-    plan, lat_err, hdg_err, s_proj  <-  Path.project(pos_xy, yaw, K)
+    plan, lat_err, hdg_err, s_proj, nearest_idx  <-  Path.project(
+        pos_xy, yaw, nearest_idx, search_radius_samples=W, K=K)
     obs                     <-  build_observation(state_gt, plan, lat_err, hdg_err)
     pinion_target           <-  PurePursuitController(obs)
     a_x_target              <-  PIDSpeedController(obs, target_speed)
@@ -84,6 +85,7 @@ GRAVITY = 9.81
 LOOKAHEAD_DS = 1.0   # arc-length spacing of Plan window [m]
 PLAN_K = 20          # number of lookahead points (covers ~ v_max * 1s preview)
 OFF_TRACK_THRESHOLD_M = 1.0   # |lateral_error| above this counts as off-track
+PROJ_SEARCH_RADIUS = 80       # local-window half-width for Path.project (samples)
 
 
 def build_path(args, num_envs, device):
@@ -246,6 +248,12 @@ def main():
         off_track_threshold=OFF_TRACK_THRESHOLD_M,
     )
 
+    # Local-window projection state (Path.project no longer scans the full
+    # course; the caller seeds nearest_idx and updates it from the returned
+    # closest_idx each step). Start at sample 0 since the vehicle was placed
+    # at path.start_pose above.
+    nearest_idx = torch.zeros(1, dtype=torch.long, device=device)
+
     for step in range(n_steps):
         t = step * sim_dt
         pos_xy = state_gt.pos_xyz[:, :2]
@@ -253,7 +261,11 @@ def main():
 
         # Pre-step projection feeds the controller (the controller observes
         # the current state, not the next one).
-        plan, lat_err, hdg_err, _ = path.project(pos_xy, yaw, K=PLAN_K, lookahead_ds=LOOKAHEAD_DS)
+        plan, lat_err, hdg_err, _, nearest_idx = path.project(
+            pos_xy, yaw, nearest_idx,
+            search_radius_samples=PROJ_SEARCH_RADIUS,
+            K=PLAN_K, lookahead_ds=LOOKAHEAD_DS,
+        )
         obs = build_observation(state_gt, plan, lat_err, hdg_err)
 
         pinion_target = pp(obs)
@@ -265,10 +277,15 @@ def main():
         # match the row's pose, vel, and actuator state. Without this the CSV
         # mixes pre-step error with post-step state, biasing rms_lat /
         # off_track_time at low-mu / DLC where the error changes quickly.
+        # Reuse the just-updated nearest_idx (don't advance it twice in one
+        # control step -- the post-step argmin window is centred where the
+        # vehicle actually is, so the update is monotone).
         post_pos_xy = state_gt.pos_xyz[:, :2]
         post_yaw = state_gt.rpy[:, 2]
-        _, lat_err_log, hdg_err_log, s_proj_log = path.project(
-            post_pos_xy, post_yaw, K=PLAN_K, lookahead_ds=LOOKAHEAD_DS
+        _, lat_err_log, hdg_err_log, s_proj_log, nearest_idx = path.project(
+            post_pos_xy, post_yaw, nearest_idx,
+            search_radius_samples=PROJ_SEARCH_RADIUS,
+            K=PLAN_K, lookahead_ds=LOOKAHEAD_DS,
         )
         progress.update(s_proj_log, state_gt.vel_body[:, 0], lat_err_log)
 

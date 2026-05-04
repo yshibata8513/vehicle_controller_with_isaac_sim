@@ -1,21 +1,25 @@
-"""World-frame reference path with GPU-parallel projection.
+"""World-frame reference path with GPU-parallel local-window projection.
 
 A `Path` discretizes a course into M uniformly-spaced (arc-length) samples
-shared across N parallel envs. All projection logic is vectorized: no
-Python loops over envs or waypoints. For typical M=1000 and N=4096 the
-per-step cost is ~16 MFLOPs on GPU -- negligible alongside PhysX.
+shared across N parallel envs. Projection cost is `O(N * W)` where
+`W = 2 * search_radius_samples + 1` -- it does NOT scale with M, so very
+long random paths (M = 100k) are as cheap to project as a 1 km loop.
 
-Construction conventions (enforced by generators in `waypoints.py`):
+Construction conventions (enforced by generators in `waypoints.py` and
+`random_path.py`):
   - Uniform `ds` spacing along arc length (so lookahead is a pure gather)
   - `psi` is the path tangent heading at each sample, wrapped to [-pi, pi]
   - For closed loops (`is_loop=True`), s wraps modulo total length
 
 Per-env-different courses are supported by stacking; share-one-course
 across envs by broadcasting from (1, M).
+
+Stateless contract: `Path` does NOT remember the previous-step nearest
+sample. The caller (TrackingEnv, classical runner, ...) owns the
+`nearest_idx` tensor and seeds it on reset.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -79,16 +83,29 @@ class Path:
         return pos_xy, yaw
 
     # ------------------------------------------------------------------
-    # Projection
+    # Projection (local-window argmin)
 
     def project(
         self,
         pos_xy: Tensor,             # (N, 2) world frame
         yaw: Tensor,                # (N,) world frame
+        nearest_idx: Tensor,        # (N,) long; previous step's closest sample
+        *,
+        search_radius_samples: int,
         K: int = 10,
         lookahead_ds: float = 1.0,
-    ) -> tuple[Plan, Tensor, Tensor, Tensor]:
-        """Project (pos_xy, yaw) onto the path (vectorized over N envs).
+    ) -> tuple[Plan, Tensor, Tensor, Tensor, Tensor]:
+        """Project (pos_xy, yaw) onto the path within a local index window.
+
+        Candidate samples are `nearest_idx[:, None] + arange(-W, W+1)` with
+        `W = search_radius_samples`. Window is wrapped (mod M) for loops
+        and clamped to `[0, M-1]` for open paths. Cost is O(N * (2W+1)).
+
+        Branch-confusion safety: as long as
+            per-step movement << W * ds << half-loop arc length
+        the local argmin stays on the same branch even at self-crossings
+        (e.g. lemniscate origin). The caller is responsible for seeding
+        `nearest_idx` on the correct branch at reset time.
 
         Returns:
             plan: body-frame K-point lookahead window (Plan, shapes (N, K))
@@ -97,69 +114,82 @@ class Path:
             heading_error: (N,) wrapped path-tangent yaw minus vehicle yaw.
                            Positive = path heads LEFT relative to vehicle.
             s_proj: (N,) cumulative arc-length at the closest sample.
-                           Use this to track monotonic progress along the
-                           course (completion / lap count) rather than the
-                           raw distance traveled by the vehicle.
+            closest_idx: (N,) long; pass back as `nearest_idx` next step.
 
         `lookahead_ds` is the arc-length step between consecutive Plan
         waypoints. Snapped to the nearest integer multiple of `self.ds`
-        (no interpolation is performed -- generators ensure `ds` is small).
+        (no interpolation -- generators ensure `ds` is small).
         """
         if pos_xy.shape != (self.num_envs, 2):
             raise ValueError(f"pos_xy shape {tuple(pos_xy.shape)} != ({self.num_envs}, 2)")
         if yaw.shape != (self.num_envs,):
             raise ValueError(f"yaw shape {tuple(yaw.shape)} != ({self.num_envs},)")
+        if nearest_idx.shape != (self.num_envs,):
+            raise ValueError(
+                f"nearest_idx shape {tuple(nearest_idx.shape)} != ({self.num_envs},)"
+            )
+        if search_radius_samples <= 0:
+            raise ValueError(
+                f"search_radius_samples must be > 0, got {search_radius_samples}"
+            )
 
         N = self.num_envs
         M = self.num_samples
         device = self.device
         batch = torch.arange(N, device=device)
+        W = int(search_radius_samples)
 
-        # 1) Closest sample (vectorized argmin)
-        dx_all = self.x - pos_xy[:, 0:1]              # (N, M)
-        dy_all = self.y - pos_xy[:, 1:2]
-        dist_sq = dx_all * dx_all + dy_all * dy_all   # (N, M)
-        closest = dist_sq.argmin(dim=-1)              # (N,)
+        # 1) Candidate index window: (N, 2W+1).
+        offsets = torch.arange(-W, W + 1, device=device, dtype=torch.long)
+        cand = nearest_idx.unsqueeze(-1) + offsets.unsqueeze(0)   # (N, 2W+1)
+        if self.is_loop:
+            cand = cand % M
+        else:
+            cand = torch.clamp(cand, min=0, max=M - 1)
+
+        # 2) Local argmin (cost is O(N * 2W+1), independent of M).
+        x_cand = self.x.gather(1, cand)        # (N, 2W+1)
+        y_cand = self.y.gather(1, cand)
+        dx = x_cand - pos_xy[:, 0:1]
+        dy = y_cand - pos_xy[:, 1:2]
+        dist_sq = dx * dx + dy * dy             # (N, 2W+1)
+        local_arg = dist_sq.argmin(dim=-1)      # (N,)
+        closest = cand[batch, local_arg]        # (N,)
 
         x_proj = self.x[batch, closest]
         y_proj = self.y[batch, closest]
         psi_proj = self.psi[batch, closest]
         s_proj = self.s[batch, closest]
 
-        # 2) Lateral / heading error using the exact tangent at the closest
-        # sample. Sub-sample refinement of the projection foot is implicit:
-        # `lateral_error` here is the perpendicular distance from `pos_xy`
-        # to the line through `(x_proj, y_proj)` with tangent `psi_proj`.
+        # 3) Lateral / heading error using the exact tangent at the closest
+        # sample. Perpendicular distance (left-positive):
+        # lateral_error = -wx*sin(psi_proj) + wy*cos(psi_proj).
         cos_p = torch.cos(psi_proj)
         sin_p = torch.sin(psi_proj)
-        wx = pos_xy[:, 0] - x_proj                     # (N,)
+        wx = pos_xy[:, 0] - x_proj
         wy = pos_xy[:, 1] - y_proj
-        # Perpendicular component (left-positive): -wx*sin + wy*cos
-        # Sign convention: vehicle to the LEFT of path tangent direction
-        # has lateral_error > 0.
         lateral_error = -wx * sin_p + wy * cos_p
         heading_error = _wrap_to_pi(psi_proj - yaw)
 
-        # 3) K-point lookahead window via integer-offset gather.
-        # ds_value is a Python float cached at construction -- no GPU sync.
+        # 4) K-point lookahead window via integer-offset gather from `closest`.
         step_count = max(1, int(round(lookahead_ds / self.ds_value)))
-        offsets = torch.arange(K, device=device, dtype=torch.long) * step_count   # (K,)
-        gather_idx = closest.unsqueeze(-1) + offsets.unsqueeze(0)   # (N, K)
+        la_offsets = torch.arange(K, device=device, dtype=torch.long) * step_count
+        gather_idx = closest.unsqueeze(-1) + la_offsets.unsqueeze(0)
         if self.is_loop:
             gather_idx = gather_idx % M
         else:
             gather_idx = torch.clamp(gather_idx, max=M - 1)
 
-        wx_la = self.x.gather(1, gather_idx)   # (N, K)
+        wx_la = self.x.gather(1, gather_idx)
         wy_la = self.y.gather(1, gather_idx)
         wv_la = self.v.gather(1, gather_idx)
 
-        # 4) World -> body transform (rotation by -yaw, then translate to origin).
-        cos_y = torch.cos(yaw).unsqueeze(-1)   # (N, 1)
+        # 5) World -> body transform (rotation by -yaw, then translate).
+        cos_y = torch.cos(yaw).unsqueeze(-1)
         sin_y = torch.sin(yaw).unsqueeze(-1)
-        dxw = wx_la - pos_xy[:, 0:1]            # (N, K)
+        dxw = wx_la - pos_xy[:, 0:1]
         dyw = wy_la - pos_xy[:, 1:2]
         plan_x = cos_y * dxw + sin_y * dyw       # body forward (+x)
         plan_y = -sin_y * dxw + cos_y * dyw      # body left (+y)
 
-        return Plan(x=plan_x, y=plan_y, v=wv_la), lateral_error, heading_error, s_proj
+        return Plan(x=plan_x, y=plan_y, v=wv_la), lateral_error, heading_error, s_proj, closest

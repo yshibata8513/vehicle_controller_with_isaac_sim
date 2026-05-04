@@ -41,7 +41,14 @@ from vehicle_rl.controller import PIDSpeedController
 from vehicle_rl.envs.sensors import build_observation
 from vehicle_rl.envs.simulator import VehicleSimulator
 from vehicle_rl.envs.types import A_X_TARGET_MAX, A_X_TARGET_MIN, VehicleAction
-from vehicle_rl.planner import circle_path, dlc_path, lemniscate_path, s_curve_path
+from vehicle_rl.planner import (
+    circle_path,
+    dlc_path,
+    lemniscate_path,
+    load_random_path_cfg,
+    random_clothoid_path,
+    s_curve_path,
+)
 
 
 PINION_MAX = DELTA_MAX_RAD * STEERING_RATIO   # 0.611 * 16 ≈ 9.776 rad
@@ -88,12 +95,35 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     robot_cfg: ArticulationCfg = SEDAN_CFG.replace(prim_path="/World/envs/env_.*/Sedan")
 
     # --- Course (Stage 0 hardcodes circle) ---
+    # Supported: "circle" (default Stage 0a), "s_curve", "dlc", "lemniscate",
+    # and "random_long" (Phase 3 random-path). For "random_long" the geometry
+    # comes from `random_path_cfg_path` (see configs/random_path.yaml).
     course: str = "circle"
     radius: float = 30.0
     target_speed: float = 10.0
     course_ds: float = 0.2
     plan_K: int = 10
     lookahead_ds: float = 1.0
+
+    # --- Random-path config (only used when course == "random_long") ---
+    # Path resolved relative to the repository root by `load_random_path_cfg`.
+    random_path_cfg_path: str = "configs/random_path.yaml"
+
+    # --- Projection (local-window argmin) ---
+    # half-window for Path.project; full window = 2W+1. With ds=0.2 and W=80
+    # the search covers ±16 m of arc length, which is >> per-step movement
+    # (~0.2 m at 10 m/s) and << half-loop length on every supported course.
+    # NOTE: only effective for built-in courses. For `course="random_long"`,
+    # the YAML `projection.search_radius_samples` overrides this default
+    # (cached on `self._projection_search_radius_samples` at __init__).
+    projection_search_radius_samples: int = 80
+    # Hard cap on per-step |delta_idx|; values above this count as a
+    # diagnostic violation (logged, not corrected). Reset envs always
+    # re-seed `_nearest_idx`, so a violation flags either branch confusion
+    # or a numerically broken projection.
+    # NOTE: only effective for built-in courses; YAML
+    # `projection.max_index_jump_samples` overrides for random_long.
+    projection_max_index_jump_samples: int = 120
 
     # --- Friction (Stage 0: fixed) ---
     mu_default: float = 0.9
@@ -183,7 +213,9 @@ class TrackingEnv(DirectRLEnv):
 
         # Course is shared across envs (Stage 0). Path tensors are broadcast
         # to (N, M); per-env vehicle pose is converted to env-local frame
-        # via env_origins before projection.
+        # via env_origins before projection. `_random_path_cfg` is set to
+        # the parsed YAML for `course="random_long"`, otherwise None.
+        self._random_path_cfg = None
         self.path = self._build_path()
 
         # Pre-compute initial pose (env-local) and yaw from path[0].
@@ -207,6 +239,42 @@ class TrackingEnv(DirectRLEnv):
         # completion / progress reward stay consistent with Phase 2 metrics.
         self._s_prev = torch.zeros(self.num_envs, device=self.device)
         self._control_dt = self.cfg.sim.dt * self.cfg.decimation
+
+        # Local-window projection state. Initialized to 0 here; `_reset_idx`
+        # sets it to the chosen path sample index per env (item B's projection
+        # analogue). The first `_compute_path_state` after a reset finds an
+        # argmin centred on this seed, so the closest sample is at most one
+        # step away -- no spurious idx-jump diagnostic alarm.
+        self._nearest_idx = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device,
+        )
+
+        # Effective projection hyperparameters. For random_long the YAML
+        # `projection.*` block wins (the random-path generator is what knows
+        # the geometric scale of the segments); for built-in courses the
+        # `TrackingEnvCfg.projection_*` defaults apply. `_compute_path_state`
+        # and the idx-jump diagnostic read these runtime members so a single
+        # source of truth governs both paths.
+        if self._random_path_cfg is not None:
+            proj = self._random_path_cfg.projection
+            self._projection_search_radius_samples = proj.search_radius_samples
+            self._projection_max_index_jump_samples = proj.max_index_jump_samples
+        else:
+            self._projection_search_radius_samples = (
+                self.cfg.projection_search_radius_samples
+            )
+            self._projection_max_index_jump_samples = (
+                self.cfg.projection_max_index_jump_samples
+            )
+
+        # Per-env local target speed at the projected path sample. Always
+        # populated from `path.v[env, closest_idx]` by `_compute_path_state`;
+        # the PI controller, progress normalization, and speed-error reward
+        # all read this single tensor so behaviour is uniform across courses
+        # (built-in courses set path.v ≡ cfg.target_speed, random_long uses
+        # per-segment speeds). Seeded here from path[0] so `_pre_physics_step`
+        # can read it before the first `_compute_path_state`.
+        self._last_target_speed = self.path.v[:, 0].clone()
 
         # Stage 0a: internal PI for the longitudinal channel when the
         # policy is steering-only. Its dt is the env step (control rate),
@@ -245,6 +313,18 @@ class TrackingEnv(DirectRLEnv):
             "Episode_Action/pinion_abs",
             "Episode_Action/pinion_rate_abs",
             "Episode_Progress/progress_norm",
+            # Local-window projection health. `idx_jump_abs` is the per-step
+            # mean of `|closest_idx - prev_nearest_idx|` (wrap-aware for
+            # loops); healthy projection sits near 1 (one sample per step at
+            # vx=10, ds=0.2, control_dt=0.02). `idx_jump_violation_rate` is
+            # the per-step mean of the indicator that the jump exceeded
+            # `_projection_max_index_jump_samples` (cfg default for built-in
+            # courses, YAML `projection.max_index_jump_samples` for
+            # random_long) -- a non-zero value signals branch confusion (e.g.
+            # lemniscate self-crossing) or window-too-small for the current
+            # excursion.
+            "Episode_PathProj/idx_jump_abs",
+            "Episode_PathProj/idx_jump_violation_rate",
         )
         self._episode_diag_sums = {
             k: torch.zeros(self.num_envs, device=self.device)
@@ -289,7 +369,12 @@ class TrackingEnv(DirectRLEnv):
         self.scene.articulations["sedan"] = self.sedan
 
     def _build_path(self):
-        """Construct the requested Stage 0 course as a Path."""
+        """Construct the requested course as a Path.
+
+        For `course="random_long"`, also caches the parsed YAML cfg on
+        `self._random_path_cfg` so `_reset_idx` can read the
+        `reset.end_margin_extra_m` and `phase1_long_path` fields.
+        """
         if self.cfg.course == "circle":
             return circle_path(
                 radius=self.cfg.radius, target_speed=self.cfg.target_speed,
@@ -309,6 +394,27 @@ class TrackingEnv(DirectRLEnv):
             return lemniscate_path(
                 target_speed=self.cfg.target_speed,
                 num_envs=self.num_envs, ds=self.cfg.course_ds, device=self.device,
+            )
+        if self.cfg.course == "random_long":
+            rp_cfg = load_random_path_cfg(self.cfg.random_path_cfg_path)
+            if abs(rp_cfg.generator.ds - self.cfg.course_ds) > 1e-9:
+                raise ValueError(
+                    f"random_path generator.ds={rp_cfg.generator.ds} != "
+                    f"TrackingEnvCfg.course_ds={self.cfg.course_ds}"
+                )
+            self._random_path_cfg = rp_cfg
+            print(
+                f"[INFO] random_long: generating {rp_cfg.phase1_long_path.length_m:.0f} m path "
+                f"(seed={rp_cfg.generator.seed}, ds={rp_cfg.generator.ds}) ...",
+                flush=True,
+            )
+            return random_clothoid_path(
+                cfg=rp_cfg,
+                num_envs=self.num_envs,
+                length_m=rp_cfg.phase1_long_path.length_m,
+                is_loop=rp_cfg.phase1_long_path.is_loop,
+                device=self.device,
+                seed_offset=0,
             )
         raise ValueError(f"unknown course {self.cfg.course}")
 
@@ -349,8 +455,11 @@ class TrackingEnv(DirectRLEnv):
             # `obs.vx`, so a SimpleNamespace stub suffices.
             vx = self._last_obs.vx if hasattr(self, "_last_obs") else \
                 self.vsim.get_state().vel_body[:, 0]
+            # `_last_target_speed` follows the local path.v at the projected
+            # sample so the PI tracks per-segment v on `random_long`. Seeded
+            # in __init__ from path[0], refreshed every `_compute_path_state`.
             a_x_target = self._pi_speed(
-                SimpleNamespace(vx=vx), target_speed=self.cfg.target_speed,
+                SimpleNamespace(vx=vx), target_speed=self._last_target_speed,
             )
         else:
             a_x_norm = actions[:, 1]
@@ -386,18 +495,39 @@ class TrackingEnv(DirectRLEnv):
     #     _reset_idx (item B), which sets it to path.s[idx] for the new pose.
 
     def _compute_path_state(self) -> None:
-        """Project current pose onto the path. No mutation of _s_prev."""
+        """Project current pose onto the path. No mutation of _s_prev.
+
+        Updates `_nearest_idx` with the projection's `closest_idx` so the
+        next call's local-window argmin is centred on the latest position.
+        Also computes wrap-aware `|delta_idx|` against the previous
+        `_nearest_idx` and stages it in `_last_idx_jump_abs` /
+        `_last_idx_jump_violation` for the diag accumulators in
+        `_get_rewards`.
+        """
         state_gt = self.vsim.get_state()
 
         pos_world_xy = state_gt.pos_xyz[:, :2]
         pos_local_xy = pos_world_xy - self.scene.env_origins[:, :2]
         yaw = state_gt.rpy[:, 2]
 
-        plan, lat_err, hdg_err, s_proj = self.path.project(
-            pos_local_xy, yaw,
+        prev_idx = self._nearest_idx
+        plan, lat_err, hdg_err, s_proj, closest_idx = self.path.project(
+            pos_local_xy, yaw, prev_idx,
+            search_radius_samples=self._projection_search_radius_samples,
             K=self.cfg.plan_K, lookahead_ds=self.cfg.lookahead_ds,
         )
         obs_struct = build_observation(state_gt, plan, lat_err, hdg_err)
+
+        # Wrap-aware |delta_idx|. For loops, idx_jump from M-1 to 0 should
+        # count as 1, not M-1; min(|d|, M-|d|) handles both directions.
+        d_abs = (closest_idx - prev_idx).abs()
+        if self.path.is_loop:
+            M = self.path.num_samples
+            d_abs = torch.minimum(d_abs, M - d_abs)
+        self._last_idx_jump_abs = d_abs.to(torch.float32)
+        self._last_idx_jump_violation = (
+            d_abs > self._projection_max_index_jump_samples
+        ).to(torch.float32)
 
         self._last_state_gt = state_gt
         self._last_obs = obs_struct
@@ -406,6 +536,11 @@ class TrackingEnv(DirectRLEnv):
         self._last_plan = plan
         self._last_pos_local = pos_local_xy
         self._last_s_proj = s_proj
+        self._nearest_idx = closest_idx
+        # plan.v[:, 0] is path.v at the projected sample (`closest_idx`); this
+        # is the single source of truth for the local target speed used by the
+        # PI controller, progress normalization, and speed reward.
+        self._last_target_speed = plan.v[:, 0]
 
     def _update_progress(self) -> None:
         """Compute progress_norm from cached s_proj and advance _s_prev.
@@ -414,9 +549,12 @@ class TrackingEnv(DirectRLEnv):
         projection-foot glitches near self-intersections / off-track
         excursions). Mirrors `utils.metrics.ProgressAccumulator` so the reward
         and the Phase 2 completion metric agree on what a "step of progress"
-        means. Normalized so progress_norm ≈ 1.0 at perfect target-speed
-        tracking (Δs ≈ target_speed × control_dt); backward motion gives a
-        negative value; standstill gives zero.
+        means. Normalized by the local target speed at the projected sample
+        (`_last_target_speed`) so progress_norm ≈ 1.0 at perfect tracking
+        regardless of whether the segment runs at v_min or v_max on
+        random_long; built-in courses (uniform v) reduce to the historical
+        `cfg.target_speed` denominator. Backward motion gives a negative
+        value; standstill gives zero.
 
         Final clamp to [-1, 1] (review item D): the velocity cap above
         permits Δs up to `2 × |vx| × dt`, so a vehicle moving at 2× target
@@ -436,7 +574,8 @@ class TrackingEnv(DirectRLEnv):
         cap = torch.clamp(vx.abs() * self._control_dt * 2.0,
                           min=self.path.ds * 2.0)
         delta_s = torch.maximum(-cap, torch.minimum(cap, delta_s))
-        progress_norm = delta_s / (self.cfg.target_speed * self._control_dt)
+        target_v = self._last_target_speed.clamp(min=1e-3)
+        progress_norm = delta_s / (target_v * self._control_dt)
         self._last_progress_norm = progress_norm.clamp(-1.0, 1.0)
         self._s_prev = s_proj.detach().clone()
 
@@ -477,7 +616,10 @@ class TrackingEnv(DirectRLEnv):
         obs = self._last_obs
         lat_err = self._last_lat_err
         hdg_err = self._last_hdg_err
-        speed_err = obs.vx - self.cfg.target_speed
+        # Speed error against the local path target (uniform on built-in
+        # courses, per-segment on random_long) so the policy is not penalized
+        # for honoring path.v.
+        speed_err = obs.vx - self._last_target_speed
 
         d_action = self._current_action - self._last_action
         rate_pinion = d_action[:, 0]
@@ -519,6 +661,9 @@ class TrackingEnv(DirectRLEnv):
         self._episode_diag_sums["Episode_Action/pinion_abs"] += self._current_action[:, 0].abs()
         self._episode_diag_sums["Episode_Action/pinion_rate_abs"] += rate_pinion.abs()
         self._episode_diag_sums["Episode_Progress/progress_norm"] += self._last_progress_norm
+        self._episode_diag_sums["Episode_PathProj/idx_jump_abs"] += self._last_idx_jump_abs
+        self._episode_diag_sums["Episode_PathProj/idx_jump_violation_rate"] += \
+            self._last_idx_jump_violation
 
         # One step's worth of reward accumulated -- bump the per-env counter
         # used as the per-step normalization denominator in `_reset_idx`.
@@ -618,16 +763,30 @@ class TrackingEnv(DirectRLEnv):
         n_reset = env_ids_t.shape[0]
         if self.cfg.random_reset_along_path:
             # Uniform random index ∈ [0, M); for open paths leave a margin
-            # near the end so the lookahead window has actual waypoints
-            # ahead instead of saturating at the last sample.
+            # near the end so the vehicle can run for a full episode without
+            # falling off the end. For built-in courses (lookahead is the
+            # only horizon constraint) this is `plan_K * lookahead_step`. For
+            # `random_long` we additionally need `v_max * episode_length_s`
+            # of arc to ensure even the fastest sampled segment fits.
             M = self.path.num_samples
             if self.path.is_loop:
                 idx = torch.randint(0, M, (n_reset,), device=self.device)
             else:
-                # Reserve plan_K * step_count samples at the end as a
-                # "no-spawn zone" so the lookahead window is well-defined.
                 step_count = max(1, int(round(self.cfg.lookahead_ds / self.path.ds)))
-                end_margin = self.cfg.plan_K * step_count
+                lookahead_margin = self.cfg.plan_K * step_count
+                if self._random_path_cfg is not None:
+                    rp = self._random_path_cfg
+                    end_margin_m = (
+                        rp.speed.v_max * self.cfg.episode_length_s
+                        + self.cfg.plan_K * self.cfg.lookahead_ds
+                        + rp.reset.end_margin_extra_m
+                    )
+                    end_margin = max(
+                        lookahead_margin,
+                        int(round(end_margin_m / self.path.ds)),
+                    )
+                else:
+                    end_margin = lookahead_margin
                 idx_max = max(1, M - end_margin)
                 idx = torch.randint(0, idx_max, (n_reset,), device=self.device)
             pos_local_xy = torch.stack(
@@ -635,11 +794,18 @@ class TrackingEnv(DirectRLEnv):
             )
             yaw = self.path.psi[env_ids_t, idx]
             s_reset = self.path.s[env_ids_t, idx]
+            v_warmstart = self.path.v[env_ids_t, idx]
         else:
             pos_local_xy = self._initial_pos_local[env_ids_t]
             yaw = self._initial_yaw[env_ids_t]
             # path[0] sits at s=0 by construction (uniform arc-length).
             s_reset = torch.zeros(n_reset, device=self.device)
+            idx = torch.zeros(n_reset, dtype=torch.long, device=self.device)
+            # Read warm-start speed from the path itself (path.v[:, 0] equals
+            # cfg.target_speed for built-in courses, the first segment's
+            # sampled v on random_long). Same source as the random-reset
+            # branch above so both paths route through path.v uniformly.
+            v_warmstart = self.path.v[env_ids_t, idx]
 
         pos_world_xy = pos_local_xy + self.scene.env_origins[env_ids_t, :2]
         z = torch.full((n_reset, 1), self.cfg.cog_z, device=self.device)
@@ -653,14 +819,15 @@ class TrackingEnv(DirectRLEnv):
 
         self.vsim.reset(env_ids=env_ids_t, initial_pose=initial_pose)
 
-        # Warm-start root velocity at target speed along the path tangent.
-        # Without this, vehicle starts at vx=0 with target=10 m/s, so
-        # speed_err^2 = 100 from step 1 -- a penalty the actuator lag
-        # (tau_drive=200ms) physically can't correct in <1s.
-        v_start = self.cfg.target_speed
+        # Warm-start root velocity at the path's local target speed along the
+        # tangent. Without this, vehicle starts at vx=0 vs (target ~10 m/s),
+        # so speed_err^2 ≈ 100 from step 1 -- a penalty the actuator lag
+        # (tau_drive=200ms) physically can't correct in <1s. For random_long
+        # the per-segment v varies across the path, so the local v[idx]
+        # gives a closer match to what the policy / internal PI will target.
         vel_world = torch.zeros((n_reset, 6), device=self.device)
-        vel_world[:, 0] = torch.cos(yaw) * v_start                       # vx_world
-        vel_world[:, 1] = torch.sin(yaw) * v_start                       # vy_world
+        vel_world[:, 0] = torch.cos(yaw) * v_warmstart                   # vx_world
+        vel_world[:, 1] = torch.sin(yaw) * v_warmstart                   # vy_world
         self.sedan.write_root_velocity_to_sim(vel_world, env_ids=env_ids_t)
 
         # Reset internal state for these envs.
@@ -671,5 +838,9 @@ class TrackingEnv(DirectRLEnv):
         # pre-reset s. Required because _get_observations no longer mutates
         # _s_prev (review item B; pairs with item A).
         self._s_prev[env_ids_t] = s_reset
+        # Seed local-window projection: the next `_compute_path_state` will
+        # search ±W samples around `idx`, so the chosen branch (in particular
+        # at self-crossings like lemniscate origin) is locked in deterministically.
+        self._nearest_idx[env_ids_t] = idx
         if self._pi_speed is not None:
             self._pi_speed.reset(env_ids=env_ids_t)

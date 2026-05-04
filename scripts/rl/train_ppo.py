@@ -33,6 +33,12 @@ parser.add_argument("--video_interval", type=int, default=2000)
 parser.add_argument("--num_envs", type=int, default=None,
                     help="Override TrackingEnvCfg.scene.num_envs.")
 parser.add_argument("--task", type=str, default="Vehicle-Tracking-Direct-v0")
+parser.add_argument("--course", type=str, default=None,
+                    help="Override TrackingEnvCfg.course "
+                         "(circle | s_curve | dlc | lemniscate | random_long).")
+parser.add_argument("--random_path_cfg", type=str, default=None,
+                    help="Override TrackingEnvCfg.random_path_cfg_path "
+                         "(only used when course=random_long).")
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--max_iterations", type=int, default=None)
 parser.add_argument("--experiment_name", type=str, default=None)
@@ -99,6 +105,10 @@ def _apply_cli_overrides(env_cfg, agent_cfg, args):
         env_cfg.scene.num_envs = args.num_envs
     if args.device is not None:
         env_cfg.sim.device = args.device
+    if args.course is not None:
+        env_cfg.course = args.course
+    if args.random_path_cfg is not None:
+        env_cfg.random_path_cfg_path = args.random_path_cfg
     if args.max_iterations is not None:
         agent_cfg.max_iterations = args.max_iterations
     if args.seed is not None:

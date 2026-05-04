@@ -12,8 +12,9 @@ Isaac Sim / Isaac Lab で**実車相当の乗用車モデル**を構築し、コ
 | 1 | 実車スケール sedan アセット (visual wheel + 剛体シャシ) | 完了 (2026-04-30) |
 | 1.5 step 1 | 自前タイヤ力注入: 線形 + 摩擦円 + 静的荷重 | 完了 (2026-04-30) |
 | 1.5 step 2 | Fiala / slip ratio | 未着手 |
-| 2 | Pure Pursuit + PID ベースライン | 未着手 |
-| 3 | RL コントローラ (PPO) | 未着手 |
+| 2 | Pure Pursuit + PID ベースライン | 完了 (2026-05-01) |
+| 3 step 1 | DirectRLEnv + Stage 0a (steering-only PPO, circle) | 完了 (2026-05-02) |
+| 3 random_long | clothoid+arc+straight ランダム経路 (fraction-based 生成) で PPO 追従 | 進行中 |
 
 ## セットアップ
 
@@ -110,6 +111,77 @@ $PY scripts/sim/run_phase1_5.py --scenario circle --mu 0.9 --target_speed 8 --st
 
 詳細は [`docs/PLAN.md` §1.5](./docs/PLAN.md) 参照。
 
+### Phase 2 — 古典制御 (Pure Pursuit + PID) ベースライン
+
+`circle` / `s_curve` / `dlc` / `lemniscate` 各コースを Pure Pursuit (横) + PID (速度) で追従:
+
+```bash
+$PY scripts/sim/run_classical.py --course circle     --mu 0.9 --target_speed 10 --duration 25 --headless
+$PY scripts/sim/run_classical.py --course s_curve    --mu 0.9 --target_speed 10 --duration 25 --headless
+$PY scripts/sim/run_classical.py --course dlc        --mu 0.9 --target_speed 10 --duration 20 --headless
+$PY scripts/sim/run_classical.py --course lemniscate --mu 0.9 --target_speed 10 --duration 35 --headless
+```
+
+出力:
+- `videos/classical_<course>_mu<μ>.mp4`
+- `metrics/classical_<course>_mu<μ>.{csv,json}`
+
+### Phase 3 — 強化学習 (PPO) 訓練 + 可視化
+
+#### Stage 0a: circle で steering-only PPO (sanity)
+
+```bash
+# 訓練 (~2 分 / 50 iter, RTX 5090): cfg.target_speed の固定速 circle を steering だけで追従。
+$PY scripts/rl/train_ppo.py --task Vehicle-Tracking-Direct-v0 \
+    --course circle --num_envs 256 --max_iterations 50 --headless \
+    --experiment_name phase3_circle --run_name stage0a_smoke
+```
+
+#### Phase 3 random_long: clothoid+arc+straight ランダム経路
+
+`configs/random_path.yaml` の `turn_heading_change_rad` / `clothoid_heading_fraction` で turn 形状を制御。`speed.v_min/v_max/ay_limit` から segment ごとに目標速を引く。
+
+```bash
+# 訓練 (~10 分 / 300 iter, 256 envs, RTX 5090; ~32GB VRAM)
+$PY scripts/rl/train_ppo.py --task Vehicle-Tracking-Direct-v0 \
+    --course random_long --random_path_cfg configs/random_path.yaml \
+    --num_envs 256 --max_iterations 300 --headless \
+    --experiment_name phase3_random_long --run_name fraction_schema_300iter
+```
+
+訓練ログは `logs/rsl_rl/<experiment>/<timestamp>_<run_name>/` に出力。TensorBoard で曲線確認:
+
+```bash
+$PY -m tensorboard.main --logdir logs/rsl_rl --port 6006
+# → http://127.0.0.1:6006/
+```
+
+#### 結果可視化 (`play.py`)
+
+学習済み policy を deterministic に走らせ、軌跡 PNG + per-step CSV をダンプ:
+
+```bash
+# 最新 run の最新 model_*.pt を自動選択
+$PY scripts/rl/play.py --task Vehicle-Tracking-Direct-v0 \
+    --course random_long --random_path_cfg configs/random_path.yaml \
+    --experiment_name phase3_random_long \
+    --num_envs 1 --duration 25 --headless
+
+# 特定 ckpt を指定する場合
+$PY scripts/rl/play.py --task Vehicle-Tracking-Direct-v0 \
+    --course random_long --random_path_cfg configs/random_path.yaml \
+    --experiment_name phase3_random_long \
+    --load_run 2026-05-04_XX-XX-XX_fraction_schema_300iter \
+    --checkpoint model_299.pt \
+    --num_envs 1 --duration 25 --headless
+```
+
+出力:
+- `metrics/play_<course>_<run>_<ckpt>.csv` — t, x, y, yaw_deg, vx, lat_err, hdg_err_deg, action_pinion
+- `videos/play_<course>_<run>_<ckpt>.png` — 軌跡 (full + zoom) / vx / lat_err 4 パネル
+
+末尾に `[RESULT] rms_lateral_err`, `max_lateral_err`, `mean_vx` をコンソールに表示。
+
 ## 設計
 
 ### 案 B（PhysX 接触に依存しない）
@@ -141,22 +213,30 @@ vehicle_rl/
 ├── .gitignore
 ├── docs/
 │   ├── PLAN.md                   # マスタープラン
-│   └── wheeledlab_reuse.md       # WheeledLab 流用方針
+│   ├── wheeledlab_reuse.md       # WheeledLab 流用方針
+│   ├── phase3_random_path_plan.md          # Phase 3 ランダム経路設計
+│   └── phase3_random_path_phase1_review.md # 同レビュー
+├── configs/
+│   └── random_path.yaml          # Phase 3 random_long 生成パラメタ
 ├── assets/
 │   └── urdf/sedan.urdf           # 実車スケール sedan URDF（USD は変換時生成）
 ├── src/vehicle_rl/
 │   ├── assets/sedan.py           # SEDAN_CFG (ArticulationCfg)
 │   ├── dynamics/                 # 案 B のタイヤ力・荷重・アクチュエータ
-│   ├── envs/                     # Phase 3 で実装
-│   ├── controller/               # Phase 2 で実装
-│   ├── planner/                  # Phase 2 で実装
-│   ├── tasks/                    # Phase 3 で gym.register
+│   ├── envs/                     # DirectRLEnv (TrackingEnv)
+│   ├── controller/               # Pure Pursuit + PID
+│   ├── planner/                  # 経路 (circle/s_curve/dlc/lemniscate/random)
+│   ├── tasks/                    # gym.register
 │   └── utils/
-└── scripts/sim/
-    ├── convert_sedan_urdf.py     # Phase 1: URDF → USD
-    ├── spawn_sedan.py            # Phase 1: spawn 確認
-    ├── run_phase1_5.py           # Phase 1.5: 動力学サニティ
-    └── phase0_wheeledlab_check.py
+├── scripts/sim/
+│   ├── convert_sedan_urdf.py     # Phase 1: URDF → USD
+│   ├── spawn_sedan.py            # Phase 1: spawn 確認
+│   ├── run_phase1_5.py           # Phase 1.5: 動力学サニティ
+│   ├── run_classical.py          # Phase 2: PP+PID ベースライン
+│   └── phase0_wheeledlab_check.py
+└── scripts/rl/
+    ├── train_ppo.py              # Phase 3: PPO 訓練
+    └── play.py                   # Phase 3: 学習済 policy の評価 / 可視化
 ```
 
 実行結果（`videos/`, `metrics/`, `logs/`, `outputs/`）と生成物（`assets/usd/`）、旧 case-A スナップショット（`legacy/`）はリポジトリ管理対象外（`.gitignore`）。

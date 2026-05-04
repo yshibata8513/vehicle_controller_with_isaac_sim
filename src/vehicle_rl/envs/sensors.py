@@ -70,7 +70,8 @@ def build_observation(
     """Assemble VehicleObservation from physics GT and planner outputs.
 
     `lateral_error` and `heading_error` are produced by the planner's
-    projection (e.g., `Path.project(pos_xy, yaw, K)`), not recomputed here.
+    projection (e.g., `Path.project(pos_xy, yaw, nearest_idx,
+    search_radius_samples=W, K=K)`), not recomputed here.
 
     Hidden from the policy: tire angle (`delta_actual`), lateral velocity
     (`vy = vel_body[:, 1]`), per-wheel quantities, mu, actuator
