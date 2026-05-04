@@ -1,0 +1,22 @@
+# Phase 2 classical baseline: Pure Pursuit + speed PI on the S-curve.
+schema_version: 1
+kind: classical
+
+seed: null
+run_name: s_curve_baseline
+
+vehicle_ref: configs/vehicles/sedan.yaml
+dynamics_ref: configs/dynamics/linear_friction_circle_flat.yaml
+course_ref: configs/courses/s_curve.yaml
+controllers:
+  lateral_ref: configs/controllers/pure_pursuit.yaml
+  longitudinal_ref: configs/controllers/speed_pi.yaml
+runtime_ref: configs/runtime/local_paths.yaml
+
+run:
+  duration_s: 25.0
+  off_track_threshold_m: 1.0
+  plan_K: 20
+  projection_search_radius_samples: 80
+  video:
+    enabled: false

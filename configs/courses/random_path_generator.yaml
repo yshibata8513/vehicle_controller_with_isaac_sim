@@ -1,0 +1,56 @@
+# Random-path generator config (Phase 3 random-path training).
+# One file is shared across random_long (Phase 1) / random_bank (Phase 2) /
+# bank regeneration (Phase 3). Sections unused by the active phase are
+# silently ignored. See docs/phase3_random_path_plan.md.
+#
+# This file replaces configs/random_path.yaml during the YAML refactor;
+# the old file is kept until PR 2 wires `course_ref: configs/courses/random_*.yaml`
+# end-to-end.
+schema_version: 1
+
+generator:
+  seed: 12345
+  ds_m: 0.2                       # path arc-length spacing; must match envs/tracking.yaml planner.lookahead_ds_m unit (m)
+  target_speed_mps: 10.0          # legacy / fallback; random paths use the per-segment speed sample
+
+speed:
+  v_min_mps: 5.0                  # lower bound of per-segment uniform sample
+  v_max_mps: 12.0                 # upper bound (before curvature cap)
+  ay_limit_mps2: 4.0              # lateral-accel limit -> v_curve_limit = sqrt(ay_limit / |kappa|)
+  segment_constant: true          # true: v held constant within a segment
+  max_resample_attempts: 50       # if v_curve_limit < v_min, resample geometry up to N times before falling back to v_min
+
+segments:
+  straight_length_m: [10.0, 80.0]                # uniform sample range
+  min_radius_m: 30.0                             # tightest curvature: |kappa| <= 1 / min_radius_m
+  max_radius_m: 150.0                            # gentlest curvature
+  turn_heading_change_rad: [0.2, 1.2]            # whole-turn heading change [rad], uniformly sampled
+  clothoid_heading_fraction: [0.25, 0.55]        # share of heading carried by the clothoid pair (rest -> arc)
+  straight_probability: 0.25
+  turn_probability: 0.75                         # straight + turn == 1.0
+  reverse_turn_probability: 0.35                 # given a turn, prob the next turn flips sign
+
+projection:
+  search_radius_samples: 80                      # half-window for local argmin (full window = 161)
+  recovery_radius_samples: 400                   # large fallback (Phase 1 logging-only; not yet runtime)
+  max_index_jump_samples: 120                    # diagnostic threshold
+
+reset:
+  # NOTE: random_reset_along_path lives in envs/tracking.yaml (env reset
+  # distribution is not a path-geometry property). Override there, not here.
+  end_margin_extra_m: 20.0                       # extra safety on top of episode_horizon + lookahead
+
+phase1_long_path:
+  length_m: 20000.0                              # 20 km open path; >> v_max * episode_length_s
+  is_loop: false
+
+phase2_bank:
+  num_paths: 1024
+  length_m: 1000.0
+  is_loop: false
+
+phase3_regeneration:
+  enabled: false
+  interval_resets: 5000
+  fraction: 0.05
+  min_unused_slots: 16

@@ -1,0 +1,7 @@
+# Phase 3 random_long: single ~20 km open path generated from the shared
+# random-path generator config. Thin wrapper so the experiment composition
+# root references a single course YAML.
+schema_version: 1
+type: random_long
+phase: phase1_long_path
+generator_ref: configs/courses/random_path_generator.yaml

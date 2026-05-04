@@ -1,0 +1,6 @@
+# Phase 3 random_bank: bank of P=num_paths independent paths, sampled per
+# env at reset. Thin wrapper around the shared generator config.
+schema_version: 1
+type: random_bank
+phase: phase2_bank
+generator_ref: configs/courses/random_path_generator.yaml

@@ -1,0 +1,95 @@
+# DirectRLEnv (Vehicle-Tracking-Direct-v0) configuration. Mirrors
+# TrackingEnvCfg defaults in src/vehicle_rl/envs/tracking_env.py. The
+# course is selected at the experiment composition root (course_ref);
+# do not bake course parameters into this file.
+schema_version: 1
+task_id: Vehicle-Tracking-Direct-v0
+
+timing:
+  physics_dt_s: 0.005       # 200 Hz physics
+  decimation: 4             # control runs at 50 Hz
+  episode_length_s: 25.0
+
+scene:
+  num_envs: 128
+  # env_spacing must clear course extent. circle r=30 -> diameter 60 m;
+  # 200 m gives ~3x margin so neighbouring envs cannot interact through any
+  # future ground / sensor effects.
+  env_spacing_m: 200.0
+  replicate_physics: true
+  clone_in_fabric: true
+
+spaces:
+  # steering_only: policy outputs steering only; an internal PI controls
+  # longitudinal acceleration toward the per-sample target speed.
+  # steering_and_accel: policy outputs [pinion, a_x].
+  action_mode: steering_only
+  observation:
+    # IMU scalar fields exposed to the policy.
+    imu_fields: [vx, yaw_rate, ax, ay, roll, pitch]
+    include_pinion_angle: true
+    include_path_errors: true     # lateral_error, heading_error, speed_error
+    include_plan: true            # K body-frame plan points
+    # World pose is intentionally excluded: policy must learn a translation/
+    # rotation-invariant tracking controller (review item 7).
+    include_world_pose: false
+
+planner:
+  plan_K: 10
+  lookahead_ds_m: 1.0
+  projection:
+    # Local-window argmin half-width (full window = 2W+1). With ds=0.2 and
+    # W=80 the search covers +/-16 m of arc length, which is >> per-step
+    # movement (~0.2 m at 10 m/s) and << half-loop length on every supported
+    # course.
+    search_radius_samples: 80
+    # Hard cap on per-step |delta_idx|; values above this count as a
+    # diagnostic violation (logged, not corrected). Reset envs always
+    # re-seed _nearest_idx, so a violation flags either branch confusion
+    # or a numerically broken projection.
+    max_index_jump_samples: 120
+
+reset:
+  # When True, each reset places the vehicle at a uniformly random path
+  # index (yaw aligned with path tangent). Distributes experience across
+  # the whole course rather than concentrating it near path[0].
+  random_reset_along_path: true
+  warm_start_velocity: true
+
+action_scaling:
+  # action=+/-1 maps to +/- pinion_action_scale_rad on the steering wheel
+  # (pinion). This is below the URDF physical limit (~9.78 rad). 3 rad gives
+  # ~2x headroom over the +/-1.4 rad needed for an r=30 circle at 10 m/s.
+  pinion_action_scale_rad: 3.0
+
+speed_controller:
+  # When action_mode=steering_only, the env runs an internal PI for the
+  # longitudinal axis. Pulled from configs/controllers/speed_pi.yaml so the
+  # same PI gains can be shared with classical baselines.
+  enabled_when_action_mode: steering_only
+  controller_ref: configs/controllers/speed_pi.yaml
+
+reward:
+  # Sign baked into weights: progress/alive positive, errors / rates negative.
+  # progress_norm = delta_s / (target_speed * control_dt); ~1.0 per step at
+  # perfect tracking.
+  progress: 1.0
+  alive: 0.1
+  lateral: -0.2          # x lateral_error^2
+  heading: -0.3          # x heading_error^2
+  speed: -0.01           # x (vx - v_target)^2
+  pinion_rate: -0.01     # x (delta action[0])^2
+  jerk: -0.001           # x (delta action[1])^2 (steering_only ignores)
+  termination: -10.0     # one-shot on early termination
+  # Clamp progress_norm before applying the weight; keeps velocity-cap
+  # overshoot from dominating reward (review item D).
+  progress_clamp: [-1.0, 1.0]
+
+termination:
+  max_lateral_error_m: 4.0
+  max_roll_rad: 1.047       # 60 deg
+
+diagnostics:
+  log_reward_terms: true
+  log_state_action_terms: true
+  log_projection_health: true

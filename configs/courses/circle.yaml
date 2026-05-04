@@ -1,0 +1,8 @@
+# Closed CCW circle. Default Stage 0a course.
+# Vehicle starts at sample[0] = (radius, 0) heading +y (yaw = pi/2).
+schema_version: 1
+type: circle
+ds_m: 0.2
+target_speed_mps: 10.0
+radius_m: 30.0
+is_loop: true

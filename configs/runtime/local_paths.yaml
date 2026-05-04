@@ -1,0 +1,8 @@
+# Repo-relative output locations. Used by training (logs / metrics) and
+# classical baselines. For machine-specific overrides commit a sibling
+# `local_paths.local.yaml` (gitignored) and reference that from the
+# experiment YAML instead.
+schema_version: 1
+logs_root: logs/rsl_rl
+metrics_dir: metrics
+video_dir: videos

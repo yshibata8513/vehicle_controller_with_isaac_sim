@@ -1,0 +1,10 @@
+# ISO 3888-2 Double Lane Change (simplified geometry; total length 61 m).
+# Open path. Cosine smoothstep in the offset transitions keeps tangent
+# continuous at section boundaries.
+schema_version: 1
+type: dlc
+ds_m: 0.2
+target_speed_mps: 13.0
+lane_offset_m: 3.5
+n_raw: 4096
+is_loop: false

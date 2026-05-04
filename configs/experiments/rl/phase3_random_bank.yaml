@@ -1,0 +1,23 @@
+# Phase 3 random_bank: steering-only PPO on a fixed bank of P=1024 random
+# paths sampled per env at reset. See docs/phase3_random_path_plan.md.
+schema_version: 1
+kind: rl_train
+
+seed: null
+run_name: phase3_random_bank
+
+vehicle_ref: configs/vehicles/sedan.yaml
+dynamics_ref: configs/dynamics/linear_friction_circle_flat.yaml
+env_ref: configs/envs/tracking.yaml
+course_ref: configs/courses/random_bank.yaml
+agent_ref: configs/agents/rsl_rl/ppo_tracking.yaml
+runtime_ref: configs/runtime/local_paths.yaml
+
+overrides:
+  env:
+    scene:
+      num_envs: 256
+  agent:
+    runner:
+      max_iterations: 300
+      experiment_name: phase3_random_bank

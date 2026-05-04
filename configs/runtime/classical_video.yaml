@@ -1,0 +1,10 @@
+# Runtime config for scripts/sim/run_classical.py with video output.
+# Wraps local_paths so the experiment only needs one runtime_ref.
+schema_version: 1
+paths_ref: configs/runtime/local_paths.yaml
+
+video:
+  enabled: true
+  # Camera and encoder settings live in the script since they depend on
+  # Isaac Lab CameraCfg shapes; they are not currently part of the YAML
+  # surface. Add fields here when they need experiment-level overrides.

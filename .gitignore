@@ -24,6 +24,9 @@ __pycache__/
 .idea/
 .claude/
 
+# agent-coop skill working dir (per-task state, codex transcripts, plan/review/report mds)
+.agent-work/
+
 # OS
 .DS_Store
 Thumbs.db

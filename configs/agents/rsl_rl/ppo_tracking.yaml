@@ -1,0 +1,40 @@
+# rsl_rl PPO config for Vehicle-Tracking-Direct-v0.
+# Mirrors src/vehicle_rl/tasks/tracking/agents/rsl_rl_ppo_cfg.py defaults.
+# experiment_name and max_iterations are overridden per experiment YAML.
+schema_version: 1
+
+runner:
+  num_steps_per_env: 64           # 1.28 s rollout @ 50 Hz
+  max_iterations: 300             # Stage 0a sanity; raise per experiment
+  save_interval: 50
+  experiment_name: vehicle_tracking_direct
+  clip_actions: 1.0               # keep action in [-1, 1]
+  obs_groups:
+    policy: [policy]
+    critic: [policy]
+
+policy:
+  # Lower than rsl_rl's default 1.0: with 1.0 the initial random pinion
+  # samples +/-1 -> +/-9.78 rad steer command and the running mean drives
+  # the vehicle into max-lock turns before the policy can learn anything.
+  # 0.3 keeps initial exploration in the linear-tire regime.
+  init_noise_std: 0.3
+  actor_obs_normalization: true
+  critic_obs_normalization: true
+  actor_hidden_dims: [256, 256]
+  critic_hidden_dims: [256, 256]
+  activation: elu
+
+algorithm:
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  entropy_coef: 0.005
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.0003
+  schedule: adaptive
+  gamma: 0.995                    # effective horizon ~200 steps
+  lam: 0.95
+  desired_kl: 0.01
+  max_grad_norm: 1.0

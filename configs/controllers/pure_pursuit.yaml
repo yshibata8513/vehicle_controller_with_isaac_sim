@@ -1,0 +1,10 @@
+# Pure Pursuit lateral controller for classical baselines.
+# delta = atan2(2 * wheelbase * y_la, x_la^2 + y_la^2); pinion = delta * steering_ratio.
+schema_version: 1
+type: pure_pursuit
+lookahead_min_m: 2.0
+# L_d = max(min, gain * vx) (vx clipped to >= 0).
+lookahead_gain_s: 0.5
+# Plan-window arc-length spacing; must match envs/tracking.yaml planner.lookahead_ds_m
+# when this controller is used inside the RL env.
+lookahead_ds_m: 1.0

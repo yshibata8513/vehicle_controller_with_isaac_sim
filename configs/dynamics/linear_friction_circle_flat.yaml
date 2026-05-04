@@ -1,0 +1,54 @@
+# Vehicle dynamics + tire / actuator coefficients (case-B linear friction
+# circle on flat ground). Mirrors VehicleSimulator.__init__ defaults and
+# A_X_TARGET_MIN/MAX in src/vehicle_rl/envs/types.py. PR 2 wires this YAML
+# through VehicleSimulator.
+schema_version: 1
+model: linear_friction_circle_flat
+
+gravity_mps2: 9.81
+
+friction:
+  # Initial mu applied to all 4 wheels. Per-wheel runtime override via
+  # VehicleSimulator.mu setter is unaffected.
+  mu_default: 0.9
+
+action_limits:
+  # Pedal-side longitudinal acceleration target box. PIDSpeedController and
+  # the RL action rescale both honour this.
+  a_x_min_mps2: -5.0
+  a_x_max_mps2: 3.0
+
+actuator_lag:
+  # First-order lag time constants (seconds). Drive uses split tau:
+  # tau_drive on positive command, tau_brake on negative.
+  tau_steer_s: 0.05
+  tau_drive_s: 0.20
+  tau_brake_s: 0.07
+  initial_value: 0.0
+
+tire:
+  type: linear_friction_circle
+  cornering_stiffness_n_per_rad: 60000.0
+  # Used inside slip-angle calculation to avoid divide-by-zero at near-zero
+  # longitudinal speed.
+  eps_vlong_mps: 0.01
+  longitudinal_force_split:
+    # accel: which axles receive Fx>0 (rear-wheel drive convention).
+    accel: rear
+    # brake: 4-wheel brake distribution.
+    brake: four_wheel
+
+normal_load:
+  type: static_weight_transfer
+  # Z-drift PD: suppresses long-time-scale numerical drift in the chassis
+  # height; not load-bearing for transient handling.
+  z_drift_kp: 50000.0
+  z_drift_kd: 5000.0
+
+attitude_damper:
+  # Roll/pitch are not in the policy observation; the damper keeps the
+  # chassis attitude bounded so the static normal-load model stays valid.
+  k_roll: 80000.0
+  c_roll: 8000.0
+  k_pitch: 80000.0
+  c_pitch: 8000.0

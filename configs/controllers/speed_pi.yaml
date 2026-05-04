@@ -1,0 +1,12 @@
+# PI longitudinal speed controller. Used both as the classical baseline
+# longitudinal controller and as the RL env's internal speed controller in
+# action_mode=steering_only.
+# u = kp * (v_target - vx) + ki * integrate(v_target - vx, dt)
+# integral clamped to +/- integral_max for anti-windup.
+# Output clamped to envs/dynamics action_limits.{a_x_min_mps2, a_x_max_mps2}
+# at the call site, not duplicated here.
+schema_version: 1
+type: speed_pi
+kp: 1.0
+ki: 0.3
+integral_max: 10.0

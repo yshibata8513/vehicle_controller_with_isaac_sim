@@ -1,0 +1,23 @@
+# Play (rollout) entry for the phase3_random_bank-trained policy. Uses the
+# same vehicle / dynamics / env / course / agent as training; switches the
+# runtime to play.yaml and overrides scene.num_envs and reset behaviour for
+# rendering a single deterministic episode.
+schema_version: 1
+kind: rl_play
+
+seed: null
+run_name: phase3_random_bank_play
+
+vehicle_ref: configs/vehicles/sedan.yaml
+dynamics_ref: configs/dynamics/linear_friction_circle_flat.yaml
+env_ref: configs/envs/tracking.yaml
+course_ref: configs/courses/random_bank.yaml
+agent_ref: configs/agents/rsl_rl/ppo_tracking.yaml
+runtime_ref: configs/runtime/play.yaml
+
+overrides:
+  env:
+    scene:
+      num_envs: 1
+    reset:
+      random_reset_along_path: false

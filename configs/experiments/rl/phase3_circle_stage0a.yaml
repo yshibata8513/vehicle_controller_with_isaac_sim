@@ -1,0 +1,25 @@
+# Phase 3 Stage 0a: steering-only PPO on the circle. The infra baseline
+# experiment; reproduces the steering-only training from commit 4ae8958.
+schema_version: 1
+kind: rl_train
+
+seed: null
+run_name: phase3_circle_stage0a
+
+vehicle_ref: configs/vehicles/sedan.yaml
+dynamics_ref: configs/dynamics/linear_friction_circle_flat.yaml
+env_ref: configs/envs/tracking.yaml
+course_ref: configs/courses/circle.yaml
+agent_ref: configs/agents/rsl_rl/ppo_tracking.yaml
+runtime_ref: configs/runtime/local_paths.yaml
+
+overrides:
+  env:
+    scene:
+      num_envs: 128
+    spaces:
+      action_mode: steering_only
+  agent:
+    runner:
+      max_iterations: 200
+      experiment_name: phase3_circle_stage0a

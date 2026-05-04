@@ -1,0 +1,10 @@
+# Lissajous figure-eight: x = a*sin(2t), y = a*sin(t), t in [0, 2*pi].
+# Self-crossing at the origin is intentionally not handled by the projection;
+# Phase 2 baseline reports rms_lateral_error ~3 m near the crossing.
+schema_version: 1
+type: lemniscate
+ds_m: 0.2
+target_speed_mps: 8.0
+a_m: 25.0
+n_raw: 4096
+is_loop: true

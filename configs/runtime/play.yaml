@@ -1,0 +1,17 @@
+# Runtime config for scripts/rl/play.py. Composes the local paths YAML so a
+# play experiment only needs a single runtime_ref.
+schema_version: 1
+paths_ref: configs/runtime/local_paths.yaml
+
+play:
+  num_envs: 1
+  duration_s: 25.0
+  # When true, on each reset the env spawns at a random index along the path;
+  # for play we usually want a deterministic start (false) so successive
+  # episodes are visually comparable.
+  force_random_reset_along_path: false
+
+plot:
+  enabled: true
+  dpi: 120
+  trajectory_pad_m: 5.0
