@@ -416,6 +416,24 @@ class TestPerShapeSchemas(unittest.TestCase):
             "runtime": {"logs_root": "logs/rsl_rl"},
         }
 
+    def _rl_play_bundle(self) -> dict:
+        # Same resolved top-level shape as rl_train; only `kind` differs.
+        # Per the plan, play YAMLs reuse train's category refs and only
+        # diverge via `overrides:` (which the loader strips before
+        # validation), so the schema is shared.
+        return {
+            "schema_version": 1,
+            "kind": "rl_play",
+            "seed": None,
+            "run_name": "phase3_random_bank_play",
+            "vehicle": {"name": "sedan"},
+            "dynamics": {"model": "linear_friction_circle_flat"},
+            "env": {"task_id": "Vehicle-Tracking-Direct-v0"},
+            "course": {"type": "random_bank"},
+            "agent": {"runner": {}, "policy": {}, "algorithm": {}},
+            "runtime": {"logs_root": "logs/rsl_rl"},
+        }
+
     def _classical_bundle(self) -> dict:
         return {
             "schema_version": 1,
@@ -433,6 +451,10 @@ class TestPerShapeSchemas(unittest.TestCase):
     def test_rl_experiment_schema_passes(self):
         validate_keys(self._rl_bundle(), RLExperimentSchema)
 
+    def test_rl_play_experiment_schema_passes(self):
+        # rl_play bundles share the resolved shape with rl_train.
+        validate_keys(self._rl_play_bundle(), RLExperimentSchema)
+
     def test_classical_experiment_schema_passes(self):
         validate_keys(self._classical_bundle(), ClassicalExperimentSchema)
 
@@ -447,6 +469,10 @@ class TestPerShapeSchemas(unittest.TestCase):
     def test_select_experiment_schema_picks_by_kind(self):
         self.assertIs(
             select_experiment_schema(self._rl_bundle()), RLExperimentSchema,
+        )
+        self.assertIs(
+            select_experiment_schema(self._rl_play_bundle()),
+            RLExperimentSchema,
         )
         self.assertIs(
             select_experiment_schema(self._classical_bundle()),

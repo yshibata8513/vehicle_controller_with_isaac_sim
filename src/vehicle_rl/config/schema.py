@@ -165,8 +165,17 @@ class AgentSchema:
 
 @dataclass
 class RLExperimentSchema:
+    """Resolved top-level shape for both `kind: rl_train` and `kind: rl_play`.
+
+    Per the YAML refactor plan, play YAMLs reuse the same category refs as
+    train (vehicle/dynamics/env/course/agent/runtime) and only differ via
+    `overrides:` (e.g. num_envs=1, random_reset_along_path=false). The
+    resolved shape is therefore identical, so a single schema covers both
+    discriminator values.
+    """
+
     schema_version: int
-    kind: str  # discriminator value: "rl_train"
+    kind: str  # discriminator value: "rl_train" or "rl_play"
     seed: Any
     run_name: str
     vehicle: dict
@@ -195,6 +204,7 @@ class ClassicalExperimentSchema:
 
 _EXPERIMENT_SCHEMAS_BY_KIND: dict[str, type] = {
     "rl_train": RLExperimentSchema,
+    "rl_play": RLExperimentSchema,
     "classical": ClassicalExperimentSchema,
 }
 
