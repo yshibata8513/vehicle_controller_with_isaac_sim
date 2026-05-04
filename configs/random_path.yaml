@@ -31,7 +31,9 @@ projection:
   max_index_jump_samples: 120     # diagnostic threshold: |delta_idx| > this counts as a violation
 
 reset:
-  random_reset_along_path: true
+  # NOTE: random_reset_along_path lives in TrackingEnvCfg (env reset
+  # distribution is not a path-geometry property; it applies to built-in
+  # courses too). Override via CLI / env_cfg, not here.
   end_margin_extra_m: 20.0        # extra safety on top of episode_horizon + lookahead
 
 phase1_long_path:

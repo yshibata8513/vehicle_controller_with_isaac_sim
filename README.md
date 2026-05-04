@@ -14,7 +14,8 @@ Isaac Sim / Isaac Lab で**実車相当の乗用車モデル**を構築し、コ
 | 1.5 step 2 | Fiala / slip ratio | 未着手 |
 | 2 | Pure Pursuit + PID ベースライン | 完了 (2026-05-01) |
 | 3 step 1 | DirectRLEnv + Stage 0a (steering-only PPO, circle) | 完了 (2026-05-02) |
-| 3 random_long | clothoid+arc+straight ランダム経路 (fraction-based 生成) で PPO 追従 | 進行中 |
+| 3 random_long | clothoid+arc+straight ランダム経路 (fraction-based 生成) で PPO 追従 | 完了 (2026-05-04) |
+| 3 random_bank | P=1024 path bank, reset 毎に env ごと独立サンプル | 進行中 |
 
 ## セットアップ
 
@@ -149,6 +150,18 @@ $PY scripts/rl/train_ppo.py --task Vehicle-Tracking-Direct-v0 \
     --experiment_name phase3_random_long --run_name fraction_schema_300iter
 ```
 
+#### Phase 3 random_bank: P 本の path bank からリセット毎にサンプル
+
+`phase2_bank.num_paths` 本の独立な random path を起動時に生成（vectorized cumsum で 1024 paths × 1 km は ~0.4 s）。各 env はリセットの度に bank から path を一様サンプル。`random_long` の単一 path より経路多様性が大きい一方、bank は固定なので Phase 3 (再生成) は別途。
+
+```bash
+# 訓練 (~10 分 / 300 iter, 256 envs, RTX 5090)。bank 1024 paths × 1 km × 5 fields ≈ 100 MB on GPU。
+$PY scripts/rl/train_ppo.py --task Vehicle-Tracking-Direct-v0 \
+    --course random_bank --random_path_cfg configs/random_path.yaml \
+    --num_envs 256 --max_iterations 300 --headless \
+    --experiment_name phase3_random_bank --run_name fixed_bank_300iter
+```
+
 訓練ログは `logs/rsl_rl/<experiment>/<timestamp>_<run_name>/` に出力。TensorBoard で曲線確認:
 
 ```bash
@@ -217,7 +230,7 @@ vehicle_rl/
 │   ├── phase3_random_path_plan.md          # Phase 3 ランダム経路設計
 │   └── phase3_random_path_phase1_review.md # 同レビュー
 ├── configs/
-│   └── random_path.yaml          # Phase 3 random_long 生成パラメタ
+│   └── random_path.yaml          # Phase 3 random_long / random_bank 生成パラメタ
 ├── assets/
 │   └── urdf/sedan.urdf           # 実車スケール sedan URDF（USD は変換時生成）
 ├── src/vehicle_rl/

@@ -17,6 +17,14 @@ Usage (from repo root):
         --course random_long --random_path_cfg configs/random_path.yaml \
         --num_envs 1 --duration 25 --headless
 
+    # random_bank: each reset samples a fresh path from the configured bank.
+    # `random_reset_along_path=False` (forced below) ensures spawn at sample 0
+    # of the freshly-sampled path, so the recorded trajectory is reproducible.
+    $PY scripts/rl/play.py --task Vehicle-Tracking-Direct-v0 \
+        --course random_bank --random_path_cfg configs/random_path.yaml \
+        --experiment_name phase3_random_bank \
+        --num_envs 1 --duration 25 --headless
+
 Defaults to the most recent run + last `model_*.pt` when --load_run /
 --checkpoint are omitted.
 """

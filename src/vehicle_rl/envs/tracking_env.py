@@ -42,11 +42,13 @@ from vehicle_rl.envs.sensors import build_observation
 from vehicle_rl.envs.simulator import VehicleSimulator
 from vehicle_rl.envs.types import A_X_TARGET_MAX, A_X_TARGET_MIN, VehicleAction
 from vehicle_rl.planner import (
+    Path,
     circle_path,
     dlc_path,
     lemniscate_path,
     load_random_path_cfg,
     random_clothoid_path,
+    random_clothoid_path_bank,
     s_curve_path,
 )
 
@@ -96,8 +98,11 @@ class TrackingEnvCfg(DirectRLEnvCfg):
 
     # --- Course (Stage 0 hardcodes circle) ---
     # Supported: "circle" (default Stage 0a), "s_curve", "dlc", "lemniscate",
-    # and "random_long" (Phase 3 random-path). For "random_long" the geometry
-    # comes from `random_path_cfg_path` (see configs/random_path.yaml).
+    # "random_long" (Phase 3 random-path single 20km path), and "random_bank"
+    # (Phase 3 random-path fixed bank of P paths sampled per reset). Both
+    # random_* courses read geometry from `random_path_cfg_path` (see
+    # configs/random_path.yaml); random_long uses the `phase1_long_path`
+    # subsection, random_bank uses `phase2_bank`.
     course: str = "circle"
     radius: float = 30.0
     target_speed: float = 10.0
@@ -105,7 +110,8 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     plan_K: int = 10
     lookahead_ds: float = 1.0
 
-    # --- Random-path config (only used when course == "random_long") ---
+    # --- Random-path config (used when course is "random_long" or
+    # "random_bank") ---
     # Path resolved relative to the repository root by `load_random_path_cfg`.
     random_path_cfg_path: str = "configs/random_path.yaml"
 
@@ -211,18 +217,30 @@ class TrackingEnv(DirectRLEnv):
             mu_default=self.cfg.mu_default,
         )
 
-        # Course is shared across envs (Stage 0). Path tensors are broadcast
-        # to (N, M); per-env vehicle pose is converted to env-local frame
-        # via env_origins before projection. `_random_path_cfg` is set to
-        # the parsed YAML for `course="random_long"`, otherwise None.
+        # Course is shared across envs by default (broadcast Path(N, M)).
+        # `course="random_bank"` instead caches a `(P, M)` bank of P
+        # independent paths; each reset samples a fresh path index per env
+        # and overwrites the corresponding row of `self.path`. The flags
+        # below are populated by `_build_path`:
+        #   `_random_path_cfg` -- parsed YAML, set for both random_long and
+        #     random_bank (gates projection-cfg override and reset margin).
+        #   `_is_bank` -- True only for random_bank; gates the per-reset
+        #     bank-row gather in `_reset_idx`.
+        #   `_path_bank` -- the (P, M) RandomPathBank; None for non-bank.
+        #   `_env_path_idx` -- (N,) long, current path index per env;
+        #     None for non-bank, otherwise overwritten on every reset.
         self._random_path_cfg = None
+        self._is_bank = False
+        self._path_bank = None
+        self._env_path_idx = None
         self.path = self._build_path()
 
-        # Pre-compute initial pose (env-local) and yaw from path[0].
-        # Stored on-device so reset never needs a CPU sync.
-        pos_local, yaw_start = self.path.start_pose      # (N, 2), (N,)
-        self._initial_pos_local = pos_local              # (N, 2)
-        self._initial_yaw = yaw_start                    # (N,)
+        # NOTE: spawn pose / yaw / arc-length are read directly from
+        # `self.path[env_ids_t, 0]` in `_reset_idx`, so no `_initial_*`
+        # cache is needed. For random_bank the bank-row gather happens
+        # *before* the spawn read, so the spawn pose tracks the freshly
+        # sampled path row -- not a stale `bank[0]` placeholder (Phase 2
+        # review item 1).
 
         # Last action (for rate / jerk penalties). Reset to 0 per env. Width
         # = `action_dim` so we can carry a 1-d (steering-only) or 2-d
@@ -415,6 +433,74 @@ class TrackingEnv(DirectRLEnv):
                 is_loop=rp_cfg.phase1_long_path.is_loop,
                 device=self.device,
                 seed_offset=0,
+            )
+        if self.cfg.course == "random_bank":
+            rp_cfg = load_random_path_cfg(self.cfg.random_path_cfg_path)
+            if abs(rp_cfg.generator.ds - self.cfg.course_ds) > 1e-9:
+                raise ValueError(
+                    f"random_path generator.ds={rp_cfg.generator.ds} != "
+                    f"TrackingEnvCfg.course_ds={self.cfg.course_ds}"
+                )
+            self._random_path_cfg = rp_cfg
+            pb = rp_cfg.phase2_bank
+            # `random_clothoid_path_bank` does not close the geometry, so
+            # treating it as a loop would wrap projection / lookahead from
+            # the open end back to the start across a discontinuity. Phase 2
+            # supports open paths only; reject loop banks at construction
+            # rather than producing silently-broken segments at runtime.
+            # See docs/phase3_random_path_phase2_review.md item 4.
+            if pb.is_loop:
+                raise ValueError(
+                    "phase2_bank.is_loop=true is not supported in Phase 2: "
+                    "the bank generator does not close path geometry. "
+                    "Set phase2_bank.is_loop=false in the random_path cfg."
+                )
+            # Sanity: each bank path must be long enough to fit one episode
+            # plus the random-reset margin -- otherwise `idx_max <= 0` in
+            # `_reset_idx` and the env will crash on first reset. We do the
+            # same conservative computation here that `_reset_idx` does, so
+            # misconfiguration fails fast at construction.
+            min_required_m = (
+                rp_cfg.speed.v_max * self.cfg.episode_length_s
+                + self.cfg.plan_K * self.cfg.lookahead_ds
+                + rp_cfg.reset.end_margin_extra_m
+            )
+            if pb.length_m <= min_required_m:
+                raise ValueError(
+                    f"phase2_bank.length_m={pb.length_m:.1f} m must exceed "
+                    f"v_max*episode_length_s + plan_horizon + end_margin "
+                    f"= {min_required_m:.1f} m (no room for random_reset_along_path)"
+                )
+            print(
+                f"[INFO] random_bank: generating {pb.num_paths} paths of "
+                f"{pb.length_m:.0f} m (seed={rp_cfg.generator.seed}, "
+                f"ds={rp_cfg.generator.ds}) ...",
+                flush=True,
+            )
+            bank = random_clothoid_path_bank(
+                cfg=rp_cfg,
+                num_paths=pb.num_paths,
+                length_m=pb.length_m,
+                is_loop=pb.is_loop,
+                device=self.device,
+            )
+            self._is_bank = True
+            self._path_bank = bank
+            # Initial per-env path = bank[0] for all envs (placeholder; the
+            # first `_reset_idx(_ALL_INDICES)` at the end of `__init__`
+            # samples real per-env indices and overwrites these rows).
+            self._env_path_idx = torch.zeros(
+                self.num_envs, dtype=torch.long, device=self.device,
+            )
+            init_idx = self._env_path_idx
+            return Path(
+                s=bank.s[init_idx].clone(),
+                x=bank.x[init_idx].clone(),
+                y=bank.y[init_idx].clone(),
+                v=bank.v[init_idx].clone(),
+                psi=bank.psi[init_idx].clone(),
+                is_loop=bank.is_loop,
+                ds_value=bank.ds,
             )
         raise ValueError(f"unknown course {self.cfg.course}")
 
@@ -757,10 +843,42 @@ class TrackingEnv(DirectRLEnv):
 
         super()._reset_idx(env_ids)
 
+        n_reset = env_ids_t.shape[0]
+
+        # For random_bank: sample a fresh path index per resetting env and
+        # overwrite the corresponding rows of self.path with the bank's
+        # geometry. Done BEFORE the reset-pose logic below, which reads
+        # `self.path.x[env_ids_t, idx]` etc. -- so the spawn pose / yaw /
+        # arc-length / warm-start v all come from the newly assigned path.
+        # Non-bank courses (built-in + random_long) leave self.path
+        # untouched.
+        #
+        # Phase 2 design choice (review item 2): the original Phase 2 plan
+        # called for path_id-gather projection -- per-env `_path_id` plus a
+        # bank-aware `Path.project` that gathers `bank.x[path_id, idx]`
+        # without ever copying. We instead copy the chosen bank row into
+        # `self.path[env_ids_t]` at reset and keep the existing
+        # `Path.project` unchanged. Cost is `n_reset * M * 5 * 4 B` per
+        # reset; for the default 256 envs / M=5000 this is ~25 MB per
+        # full-batch reset and is negligible vs the per-step physics work.
+        # Trade-off accepted because (a) the projection / observation hot
+        # path stays untouched, (b) the running env's path is independent
+        # of the bank tensor (matters for Phase 3 partial regeneration --
+        # we can overwrite bank slots without disturbing in-flight rollouts).
+        if self._is_bank:
+            new_path_idx = torch.randint(
+                0, self._path_bank.num_paths, (n_reset,), device=self.device,
+            )
+            self._env_path_idx[env_ids_t] = new_path_idx
+            self.path.s[env_ids_t] = self._path_bank.s[new_path_idx]
+            self.path.x[env_ids_t] = self._path_bank.x[new_path_idx]
+            self.path.y[env_ids_t] = self._path_bank.y[new_path_idx]
+            self.path.v[env_ids_t] = self._path_bank.v[new_path_idx]
+            self.path.psi[env_ids_t] = self._path_bank.psi[new_path_idx]
+
         # Per-env reset pose. Stage 0 default: random index along the path
         # (item 2). When `random_reset_along_path=False`, fall back to the
         # path[0] start pose for reproducibility (e.g., eval rollouts).
-        n_reset = env_ids_t.shape[0]
         if self.cfg.random_reset_along_path:
             # Uniform random index ∈ [0, M); for open paths leave a margin
             # near the end so the vehicle can run for a full episode without
@@ -796,15 +914,24 @@ class TrackingEnv(DirectRLEnv):
             s_reset = self.path.s[env_ids_t, idx]
             v_warmstart = self.path.v[env_ids_t, idx]
         else:
-            pos_local_xy = self._initial_pos_local[env_ids_t]
-            yaw = self._initial_yaw[env_ids_t]
-            # path[0] sits at s=0 by construction (uniform arc-length).
-            s_reset = torch.zeros(n_reset, device=self.device)
+            # Spawn at sample 0 of each env's *current* path. For random_bank
+            # this matters: by the time we reach this branch, the bank-row
+            # gather above has overwritten `self.path[env_ids_t]` with the
+            # freshly-sampled path, so `self.path.x[env_ids_t, 0]` etc. give
+            # the start pose of the new path -- not the stale `bank[0]`
+            # placeholder seeded at construction. For built-in courses /
+            # random_long the per-env rows are identical to the broadcast
+            # path[0], so behaviour is unchanged. play.py sets
+            # `random_reset_along_path=False` for deterministic eval, which
+            # makes this branch the hot path for random_bank rollouts. See
+            # docs/phase3_random_path_phase2_review.md item 1.
             idx = torch.zeros(n_reset, dtype=torch.long, device=self.device)
-            # Read warm-start speed from the path itself (path.v[:, 0] equals
-            # cfg.target_speed for built-in courses, the first segment's
-            # sampled v on random_long). Same source as the random-reset
-            # branch above so both paths route through path.v uniformly.
+            pos_local_xy = torch.stack(
+                [self.path.x[env_ids_t, idx], self.path.y[env_ids_t, idx]],
+                dim=-1,
+            )
+            yaw = self.path.psi[env_ids_t, idx]
+            s_reset = self.path.s[env_ids_t, idx]
             v_warmstart = self.path.v[env_ids_t, idx]
 
         pos_world_xy = pos_local_xy + self.scene.env_origins[env_ids_t, :2]

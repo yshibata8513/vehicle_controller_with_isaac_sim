@@ -91,7 +91,9 @@ class _ProjectionCfg:
 
 @dataclass
 class _ResetCfg:
-    random_reset_along_path: bool
+    # `random_reset_along_path` deliberately omitted: env reset distribution
+    # is a TrackingEnvCfg concern (applies to built-in courses too) and is
+    # set via CLI / env_cfg override, not via this YAML.
     end_margin_extra_m: float
 
 
@@ -246,7 +248,6 @@ def load_random_path_cfg(path: str | PathLike) -> RandomPathGeneratorCfg:
             max_index_jump_samples=int(pj["max_index_jump_samples"]),
         ),
         reset=_ResetCfg(
-            random_reset_along_path=bool(rs["random_reset_along_path"]),
             end_margin_extra_m=float(rs["end_margin_extra_m"]),
         ),
         phase1_long_path=_Phase1Cfg(
@@ -407,6 +408,48 @@ def _segment_speed(
     return s.v_min + u * (v_sample_max - s.v_min)
 
 
+def _integrate_kappa_v(
+    kappa: Tensor,        # (M,) curvature at each sample [1/m]
+    v: Tensor,            # (M,) target speed at each sample [m/s]
+    ds: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Vectorized cumsum integration; returns (s, x, y, psi, v) each (M,).
+
+    Equivalent to the forward-Euler recurrence
+        psi[i+1] = psi[i] + kappa[i] * ds
+        x[i+1]   = x[i]   + cos(psi[i]) * ds
+        y[i+1]   = y[i]   + sin(psi[i]) * ds
+    expressed as `cat([0], cumsum(...[:-1]))`, so a 100k-sample path
+    integrates in milliseconds instead of the seconds a Python loop takes.
+    The Phase 2 bank (`random_clothoid_path_bank`) calls this 1024+ times,
+    so the speedup matters for env startup time.
+
+    Numerical equivalence to the loop is exact for psi (cumsum of float32
+    products is bit-identical to the sequential sum); for x/y the use of
+    `torch.cos`/`torch.sin` instead of `math.cos`/`math.sin` introduces
+    sub-ULP differences that are negligible vs the integration error
+    accumulated over the path.
+    """
+    M = kappa.shape[0]
+    delta_psi = kappa[:-1] * ds                     # (M-1,)
+    psi_unwrapped = torch.cat(
+        [torch.zeros(1, dtype=torch.float32), torch.cumsum(delta_psi, dim=0)],
+    )                                                # (M,)
+    cos_psi = torch.cos(psi_unwrapped)
+    sin_psi = torch.sin(psi_unwrapped)
+    x = torch.cat(
+        [torch.zeros(1, dtype=torch.float32),
+         torch.cumsum(cos_psi[:-1] * ds, dim=0)],
+    )
+    y = torch.cat(
+        [torch.zeros(1, dtype=torch.float32),
+         torch.cumsum(sin_psi[:-1] * ds, dim=0)],
+    )
+    psi = _wrap_to_pi(psi_unwrapped)
+    s = torch.arange(M, dtype=torch.float32) * ds
+    return s, x, y, psi, v
+
+
 def _integrate_path(
     kappa: Tensor,        # (M,) curvature at each sample [1/m]
     v: Tensor,            # (M,) target speed at each sample [m/s]
@@ -417,19 +460,7 @@ def _integrate_path(
     num_envs: int,
 ) -> Path:
     """Integrate (kappa, v) into a Path (broadcast to num_envs)."""
-    M = kappa.shape[0]
-    # Forward integration on CPU for simplicity; this runs once at startup.
-    psi = torch.zeros(M, dtype=torch.float32)
-    x = torch.zeros(M, dtype=torch.float32)
-    y = torch.zeros(M, dtype=torch.float32)
-    # psi[0] = 0; x[0] = y[0] = 0.
-    for i in range(M - 1):
-        psi[i + 1] = psi[i] + kappa[i] * ds
-        x[i + 1] = x[i] + math.cos(float(psi[i].item())) * ds
-        y[i + 1] = y[i] + math.sin(float(psi[i].item())) * ds
-    psi = _wrap_to_pi(psi)
-
-    s = torch.arange(M, dtype=torch.float32) * ds
+    s, x, y, psi, v = _integrate_kappa_v(kappa, v, ds)
 
     # Move to device, broadcast to (num_envs, M).
     def expand(t: Tensor) -> Tensor:
@@ -441,6 +472,71 @@ def _integrate_path(
         is_loop=is_loop,
         ds_value=ds,
     )
+
+
+def _generate_one_path_kappa_v(
+    cfg: RandomPathGeneratorCfg,
+    length_m: float,
+    seed_offset: int,
+) -> tuple[Tensor, Tensor, int, int]:
+    """Sample one random path's (kappa, v) of shape (M,) each.
+
+    M = max(8, round(length_m / ds)). Returns also (n_speed_rejects,
+    n_v_min_fallback) so callers can either log per-path (single-path use)
+    or aggregate across a bank.
+    """
+    ds = cfg.generator.ds
+    M = max(8, int(round(length_m / ds)))
+
+    rng = torch.Generator()
+    rng.manual_seed(int(cfg.generator.seed) + int(seed_offset))
+
+    kappa_buf: list[Tensor] = []
+    v_buf: list[Tensor] = []
+    last_turn_sign = 0
+    total_n = 0
+    n_v_min_fallback = 0
+    n_speed_rejects = 0
+    max_attempts = max(1, cfg.speed.max_resample_attempts)
+    while total_n < M:
+        # Per-segment speed-feasibility retry (item 4). Geometry is
+        # structurally bounded by `turn_heading_change_rad` (item 3
+        # better-design) so `_sample_segment_kappa_length` never rejects;
+        # only `_segment_speed` may reject when `v_curve_limit < v_min`.
+        # Each retry redraws R / heading_total / fraction so a fresh kappa
+        # profile is tried. The accepted `(k_seg, sign)` is committed only
+        # after the loop so a rejected attempt does not bias
+        # `last_turn_sign`. On retry exhaustion the last sampled geometry
+        # is accepted at `v_min` as a last-resort fallback.
+        k_seg: Tensor | None = None
+        proposed_sign = last_turn_sign
+        v_seg_val: float | None = None
+        for _ in range(max_attempts):
+            k_try, _L_seg, sign_try = _sample_segment_kappa_length(
+                cfg, rng, last_turn_sign=last_turn_sign,
+            )
+            v_try = _segment_speed(cfg, k_try, rng)
+            if v_try is None:
+                n_speed_rejects += 1
+                k_seg = k_try
+                proposed_sign = sign_try
+                continue
+            k_seg = k_try
+            proposed_sign = sign_try
+            v_seg_val = v_try
+            break
+        if v_seg_val is None:
+            v_seg_val = cfg.speed.v_min
+            n_v_min_fallback += 1
+        v_seg = torch.full_like(k_seg, v_seg_val)
+        kappa_buf.append(k_seg)
+        v_buf.append(v_seg)
+        last_turn_sign = proposed_sign
+        total_n += k_seg.shape[0]
+
+    kappa = torch.cat(kappa_buf, dim=0)[:M]
+    v = torch.cat(v_buf, dim=0)[:M]
+    return kappa, v, n_speed_rejects, n_v_min_fallback
 
 
 def random_clothoid_path(
@@ -467,68 +563,98 @@ def random_clothoid_path(
     samples so a bank of paths sharing one cfg can be stacked into a
     `(P, M)` tensor.
     """
-    ds = cfg.generator.ds
-    M = max(8, int(round(length_m / ds)))
-
-    rng = torch.Generator()
-    rng.manual_seed(int(cfg.generator.seed) + int(seed_offset))
-
-    kappa_buf: list[Tensor] = []
-    v_buf: list[Tensor] = []
-    last_turn_sign = 0
-    total_n = 0
-    n_v_min_fallback = 0
-    n_speed_rejects = 0
-    max_attempts = max(1, cfg.speed.max_resample_attempts)
-    while total_n < M:
-        # Per-segment speed-feasibility retry (item 4). Geometry is now
-        # structurally bounded by `turn_heading_change_rad` (item 3
-        # better-design) so `_sample_segment_kappa_length` never rejects;
-        # only `_segment_speed` may reject when `v_curve_limit < v_min`.
-        # Each retry redraws R / heading_total / fraction so a fresh kappa
-        # profile is tried. The accepted `(k_seg, sign)` is committed only
-        # after the loop so a rejected attempt does not bias
-        # `last_turn_sign`. On retry exhaustion the last sampled geometry
-        # is accepted at `v_min` as a last-resort fallback.
-        k_seg: Tensor | None = None
-        proposed_sign = last_turn_sign
-        v_seg_val: float | None = None
-        for _ in range(max_attempts):
-            k_try, _L_seg, sign_try = _sample_segment_kappa_length(
-                cfg, rng, last_turn_sign=last_turn_sign,
-            )
-            v_try = _segment_speed(cfg, k_try, rng)
-            if v_try is None:
-                n_speed_rejects += 1
-                # Keep the latest geometry as a fallback candidate.
-                k_seg = k_try
-                proposed_sign = sign_try
-                continue
-            k_seg = k_try
-            proposed_sign = sign_try
-            v_seg_val = v_try
-            break
-        if v_seg_val is None:
-            # All retries produced an infeasible curve speed; accept the
-            # last sampled geometry at v_min so generation cannot deadlock.
-            v_seg_val = cfg.speed.v_min
-            n_v_min_fallback += 1
-        v_seg = torch.full_like(k_seg, v_seg_val)
-        kappa_buf.append(k_seg)
-        v_buf.append(v_seg)
-        last_turn_sign = proposed_sign
-        total_n += k_seg.shape[0]
+    kappa, v, n_speed_rejects, n_v_min_fallback = _generate_one_path_kappa_v(
+        cfg, length_m, seed_offset,
+    )
     if n_speed_rejects > 0 or n_v_min_fallback > 0:
         print(
             f"[INFO] random_clothoid_path: {n_speed_rejects} speed rejects, "
-            f"{n_v_min_fallback} v_min fallbacks (total segments accepted = "
-            f"{len(kappa_buf)})",
+            f"{n_v_min_fallback} v_min fallbacks",
             flush=True,
         )
 
-    kappa = torch.cat(kappa_buf, dim=0)[:M]
-    v = torch.cat(v_buf, dim=0)[:M]
-
     return _integrate_path(
-        kappa, v, ds, is_loop=is_loop, device=device, num_envs=num_envs,
+        kappa, v, cfg.generator.ds,
+        is_loop=is_loop, device=device, num_envs=num_envs,
+    )
+
+
+@dataclass
+class RandomPathBank:
+    """A bank of `num_paths` independent random paths, all sharing the
+    same `ds` and `is_loop`.
+
+    Stored as `(P, M)` tensors on `device` so per-env path selection at
+    reset is a single advanced-index gather (`bank.x[path_idx]` →
+    `(n_reset, M)`). Designed to be sliced into the env's per-env
+    `Path(N, M)` tensors -- see `TrackingEnv._reset_idx`.
+    """
+    s: Tensor       # (P, M)
+    x: Tensor       # (P, M)
+    y: Tensor       # (P, M)
+    v: Tensor       # (P, M)
+    psi: Tensor     # (P, M)
+    ds: float
+    is_loop: bool
+
+    @property
+    def num_paths(self) -> int:
+        return self.x.shape[0]
+
+    @property
+    def num_samples(self) -> int:
+        return self.x.shape[1]
+
+
+def random_clothoid_path_bank(
+    *,
+    cfg: RandomPathGeneratorCfg,
+    num_paths: int,
+    length_m: float,
+    is_loop: bool,
+    device: torch.device | str,
+    seed_base: int = 0,
+) -> RandomPathBank:
+    """Generate a fixed bank of `num_paths` random paths.
+
+    Uses `seed_base + p` as `seed_offset` for path index `p`, so each path
+    gets a unique deterministic RNG stream. Reject / fallback counts are
+    aggregated and a single `[INFO]` summary is printed at the end (per-
+    path prints would flood the log for P=1024).
+
+    Cost: with vectorized `_integrate_kappa_v`, P=1024 paths of length
+    1 km @ ds=0.2 (M=5000) take a few seconds total on CPU. Memory:
+    P × M × 5 fields × 4 B ≈ 100 MB on device for P=1024, M=5000 -- fine
+    on a 24 GB+ GPU.
+    """
+    ds = cfg.generator.ds
+    s_list, x_list, y_list, psi_list, v_list = [], [], [], [], []
+    n_speed_rejects_total = 0
+    n_v_min_fallback_total = 0
+    for p in range(num_paths):
+        kappa, v_one, n_rej, n_fb = _generate_one_path_kappa_v(
+            cfg, length_m, seed_offset=seed_base + p,
+        )
+        s, x, y, psi, v_t = _integrate_kappa_v(kappa, v_one, ds)
+        s_list.append(s); x_list.append(x); y_list.append(y)
+        psi_list.append(psi); v_list.append(v_t)
+        n_speed_rejects_total += n_rej
+        n_v_min_fallback_total += n_fb
+
+    print(
+        f"[INFO] random_clothoid_path_bank: built {num_paths} paths "
+        f"(M={s_list[0].shape[0]} samples each, total speed_rejects="
+        f"{n_speed_rejects_total}, v_min_fallbacks="
+        f"{n_v_min_fallback_total})",
+        flush=True,
+    )
+
+    return RandomPathBank(
+        s=torch.stack(s_list, dim=0).to(device),
+        x=torch.stack(x_list, dim=0).to(device),
+        y=torch.stack(y_list, dim=0).to(device),
+        v=torch.stack(v_list, dim=0).to(device),
+        psi=torch.stack(psi_list, dim=0).to(device),
+        ds=ds,
+        is_loop=is_loop,
     )

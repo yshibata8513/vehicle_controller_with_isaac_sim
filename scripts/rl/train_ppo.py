@@ -35,10 +35,10 @@ parser.add_argument("--num_envs", type=int, default=None,
 parser.add_argument("--task", type=str, default="Vehicle-Tracking-Direct-v0")
 parser.add_argument("--course", type=str, default=None,
                     help="Override TrackingEnvCfg.course "
-                         "(circle | s_curve | dlc | lemniscate | random_long).")
+                         "(circle | s_curve | dlc | lemniscate | random_long | random_bank).")
 parser.add_argument("--random_path_cfg", type=str, default=None,
                     help="Override TrackingEnvCfg.random_path_cfg_path "
-                         "(only used when course=random_long).")
+                         "(used when course is random_long or random_bank).")
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--max_iterations", type=int, default=None)
 parser.add_argument("--experiment_name", type=str, default=None)
