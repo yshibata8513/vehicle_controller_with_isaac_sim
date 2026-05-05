@@ -171,6 +171,50 @@ class TestMakeSimulatorKwargs(unittest.TestCase):
         kw = make_simulator_kwargs(b)
         self.assertEqual(kw["actuator_initial_value"], 0.42)
 
+    def test_actuator_reset_uses_initial_value_from_yaml(self):
+        # PR 2 round-2 fix: it's not enough that `actuator_initial_value`
+        # flows into VehicleSimulator.__init__; VehicleSimulator.reset()
+        # must also revert actuator state to that value (it previously
+        # hard-coded 0.0). We test FirstOrderLagActuator directly because
+        # VehicleSimulator construction needs Isaac Sim, and the simulator's
+        # reset() now simply forwards to actuator.reset() with no `value=`,
+        # so the actuator's behavior is the contract under test.
+        import torch
+
+        from vehicle_rl.dynamics import FirstOrderLagActuator
+
+        act = FirstOrderLagActuator(
+            num_envs=3, device="cpu",
+            tau_pos=0.05, initial_value=0.3,
+        )
+        # Drive state away from the initial value.
+        u = torch.full((3,), 1.0)
+        for _ in range(5):
+            act.step(u, dt=0.02)
+        self.assertGreater(float(act.value[0].item()), 0.3)
+
+        # reset() with no explicit value reverts to initial_value=0.3.
+        act.reset()
+        for v in act.value.tolist():
+            self.assertAlmostEqual(v, 0.3, places=6)
+
+        # Drive state away again, then verify partial reset (env_ids subset)
+        # also targets initial_value, leaving other envs untouched.
+        for _ in range(5):
+            act.step(u, dt=0.02)
+        moved = float(act.value[2].item())
+        act.reset(env_ids=torch.tensor([0, 1]))
+        self.assertAlmostEqual(float(act.value[0].item()), 0.3, places=6)
+        self.assertAlmostEqual(float(act.value[1].item()), 0.3, places=6)
+        # Env 2 was excluded -> still moved.
+        self.assertAlmostEqual(float(act.value[2].item()), moved, places=6)
+
+        # Explicit override still works (back-compat for any caller that
+        # wants 0.0 specifically).
+        act.reset(value=0.0)
+        for v in act.value.tolist():
+            self.assertAlmostEqual(v, 0.0, places=6)
+
     def test_eps_vlong_flows_through(self):
         b = copy.deepcopy(_dynamics_bundle())
         b["tire"]["eps_vlong_mps"] = 0.05

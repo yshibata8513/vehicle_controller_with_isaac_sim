@@ -29,7 +29,8 @@ class FirstOrderLagActuator:
         self.tau_pos = float(tau_pos)
         self.tau_neg = float(tau_neg) if tau_neg is not None else float(tau_pos)
         self._split_tau = self.tau_pos != self.tau_neg
-        self._y = torch.full((num_envs,), float(initial_value), device=self.device)
+        self._initial_value = float(initial_value)
+        self._y = torch.full((num_envs,), self._initial_value, device=self.device)
         # dt-dependent alpha = 1 - exp(-dt/tau). Lazily computed and cached on
         # first step(); refreshed only if dt changes (it doesn't in current
         # usage, since SimulationContext's physics dt is fixed). Computing
@@ -62,11 +63,17 @@ class FirstOrderLagActuator:
         self._y = self._y + alpha * (u - self._y)
         return self._y
 
-    def reset(self, value: float = 0.0, env_ids: Tensor | None = None) -> None:
+    def reset(self, value: float | None = None, env_ids: Tensor | None = None) -> None:
+        """Reset actuator state. If `value` is None (default), reverts to the
+        `initial_value` saved at construction (so YAML
+        `actuator_lag.initial_value` reaches both __init__ and reset).
+        Callers may still pass an explicit numeric override.
+        """
+        target = self._initial_value if value is None else float(value)
         if env_ids is None:
-            self._y[:] = value
+            self._y[:] = target
         else:
-            self._y[env_ids] = value
+            self._y[env_ids] = target
 
     @property
     def value(self) -> Tensor:

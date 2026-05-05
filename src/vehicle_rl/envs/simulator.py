@@ -246,9 +246,11 @@ class VehicleSimulator:
         self.sedan.write_joint_state_to_sim(jp, jv, env_ids=env_ids_t)
         self.sedan.reset(env_ids=env_ids_t)
 
-        # Reset Python-side internal state (slice-update only)
-        self.steer_act.reset(value=0.0, env_ids=env_ids_t)
-        self.drive_act.reset(value=0.0, env_ids=env_ids_t)
+        # Reset Python-side internal state (slice-update only). Omit
+        # `value=` so each actuator reverts to its construction-time
+        # `initial_value` (sourced from `actuator_lag.initial_value` in YAML).
+        self.steer_act.reset(env_ids=env_ids_t)
+        self.drive_act.reset(env_ids=env_ids_t)
         self._a_y_estimate[env_ids_t] = 0.0
 
         # Cached force/accel: revert reset envs to static/zero, leave others.
