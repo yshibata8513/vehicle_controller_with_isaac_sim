@@ -1136,5 +1136,163 @@ class TestTrackingYAMLLeafCoverage(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# PR 3 round-2 fixes (F1a / F1b / F3)
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(_isaaclab_available(),
+                     "isaaclab not importable; skipping gravity/steering_ratio cfg test")
+class TestRound2GravityAndSteeringRatio(unittest.TestCase):
+    """F1a + F1b: PhysX gravity and steering_ratio flow through cfg from YAML."""
+
+    def test_gravity_from_yaml_reaches_sim_cfg(self):
+        # F1a: a non-default gravity value (moon, 1.62 m/s^2) must reach
+        # `cfg.sim.gravity` as `(0.0, 0.0, -1.62)`.
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+
+        dyn = copy.deepcopy(_dynamics_bundle())
+        dyn["gravity_mps2"] = 1.62
+        cfg = make_tracking_env_cfg(
+            _env_bundle(), _course_bundle("circle"),
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=_vehicle_bundle(), dynamics_bundle=dyn,
+        )
+        self.assertEqual(tuple(cfg.sim.gravity), (0.0, 0.0, -1.62))
+
+    def test_default_gravity_is_minus_9_81(self):
+        # Sanity: the default YAML still maps to PhysX 9.81 negative-z.
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+
+        cfg = make_tracking_env_cfg(
+            _env_bundle(), _course_bundle("circle"),
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=_vehicle_bundle(), dynamics_bundle=_dynamics_bundle(),
+        )
+        gz = float(cfg.sim.gravity[2])
+        self.assertAlmostEqual(gz, -9.81, places=6)
+        self.assertEqual(float(cfg.sim.gravity[0]), 0.0)
+        self.assertEqual(float(cfg.sim.gravity[1]), 0.0)
+
+    def test_steering_ratio_from_vehicle_yaml_reaches_cfg(self):
+        # F1b: a non-default steering_ratio (12.0) reaches cfg.steering_ratio
+        # so TrackingEnv.__init__ no longer needs the assets-module constant.
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+
+        veh = copy.deepcopy(_vehicle_bundle())
+        veh["steering"]["steering_ratio"] = 12.0
+        cfg = make_tracking_env_cfg(
+            _env_bundle(), _course_bundle("circle"),
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=veh, dynamics_bundle=_dynamics_bundle(),
+        )
+        self.assertEqual(float(cfg.steering_ratio), 12.0)
+        # And derived pinion_max tracks: delta_max_rad * steering_ratio.
+        self.assertAlmostEqual(
+            float(cfg.pinion_max),
+            float(veh["steering"]["delta_max_rad"]) * 12.0,
+            places=6,
+        )
+
+
+class TestRound2NoSteeringRatioImportInTrackingEnv(unittest.TestCase):
+    """F1b: tracking_env.py must not import STEERING_RATIO from assets."""
+
+    def test_steering_ratio_module_constant_not_imported(self):
+        env_src = (
+            REPO_ROOT / "src" / "vehicle_rl" / "envs" / "tracking_env.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "from vehicle_rl.assets import STEERING_RATIO",
+            env_src,
+            "tracking_env.py still imports the module-level STEERING_RATIO; "
+            "the value must come via cfg.steering_ratio (vehicle YAML).",
+        )
+        self.assertNotIn(
+            "steering_ratio=STEERING_RATIO",
+            env_src,
+            "tracking_env.py still passes the module constant; use "
+            "cfg.steering_ratio instead.",
+        )
+
+
+class TestRound2LegacyCourseDedicatedYamls(unittest.TestCase):
+    """F3: s_curve / dlc / lemniscate now resolve to dedicated experiment YAMLs."""
+
+    def test_legacy_s_curve_maps_to_phase3_s_curve_yaml(self):
+        from vehicle_rl.tasks.tracking.entry_points import LEGACY_COURSE_TO_EXPERIMENT
+        self.assertTrue(
+            LEGACY_COURSE_TO_EXPERIMENT["s_curve"].endswith("phase3_s_curve.yaml"),
+            f"got {LEGACY_COURSE_TO_EXPERIMENT['s_curve']!r}",
+        )
+
+    def test_legacy_dlc_maps_to_phase3_dlc_yaml(self):
+        from vehicle_rl.tasks.tracking.entry_points import LEGACY_COURSE_TO_EXPERIMENT
+        self.assertTrue(
+            LEGACY_COURSE_TO_EXPERIMENT["dlc"].endswith("phase3_dlc.yaml"),
+        )
+
+    def test_legacy_lemniscate_maps_to_phase3_lemniscate_yaml(self):
+        from vehicle_rl.tasks.tracking.entry_points import LEGACY_COURSE_TO_EXPERIMENT
+        self.assertTrue(
+            LEGACY_COURSE_TO_EXPERIMENT["lemniscate"].endswith("phase3_lemniscate.yaml"),
+        )
+
+    def test_phase3_s_curve_loads_and_routes_to_s_curve_course(self):
+        # F3: confirm the new YAML loads cleanly via load_experiment and the
+        # resolved course.type is "s_curve" (not "circle"). Same for dlc /
+        # lemniscate.
+        from vehicle_rl.config.loader import load_experiment
+
+        bundle = load_experiment(
+            REPO_ROOT / "configs" / "experiments" / "rl" / "phase3_s_curve.yaml",
+            repo_root=REPO_ROOT,
+        )
+        self.assertEqual(bundle["course"]["type"], "s_curve")
+        self.assertEqual(
+            bundle["agent"]["runner"]["experiment_name"], "phase3_s_curve"
+        )
+
+    def test_phase3_dlc_loads_and_routes_to_dlc_course(self):
+        from vehicle_rl.config.loader import load_experiment
+
+        bundle = load_experiment(
+            REPO_ROOT / "configs" / "experiments" / "rl" / "phase3_dlc.yaml",
+            repo_root=REPO_ROOT,
+        )
+        self.assertEqual(bundle["course"]["type"], "dlc")
+
+    def test_phase3_lemniscate_loads_and_routes_to_lemniscate_course(self):
+        from vehicle_rl.config.loader import load_experiment
+
+        bundle = load_experiment(
+            REPO_ROOT / "configs" / "experiments" / "rl" / "phase3_lemniscate.yaml",
+            repo_root=REPO_ROOT,
+        )
+        self.assertEqual(bundle["course"]["type"], "lemniscate")
+
+    @unittest.skipUnless(_isaaclab_available(),
+                         "isaaclab not importable; skipping factory cfg.course test")
+    def test_s_curve_factory_yields_cfg_course_s_curve(self):
+        # End-to-end: load the dedicated YAML, run it through the factory,
+        # confirm cfg.course is "s_curve" (not "circle"). This is what the
+        # post-factory `cfg.course = args.course` patch used to enforce.
+        import os as _os
+        from vehicle_rl.tasks.tracking.entry_points import (
+            LEGACY_COURSE_TO_EXPERIMENT, tracking_env_cfg_factory,
+        )
+
+        prev = _os.environ.get("VEHICLE_RL_EXPERIMENT_YAML")
+        _os.environ["VEHICLE_RL_EXPERIMENT_YAML"] = LEGACY_COURSE_TO_EXPERIMENT["s_curve"]
+        try:
+            cfg = tracking_env_cfg_factory()
+            self.assertEqual(cfg.course, "s_curve")
+        finally:
+            if prev is None:
+                _os.environ.pop("VEHICLE_RL_EXPERIMENT_YAML", None)
+            else:
+                _os.environ["VEHICLE_RL_EXPERIMENT_YAML"] = prev
+
+
 if __name__ == "__main__":
     unittest.main()

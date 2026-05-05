@@ -1,0 +1,26 @@
+# Phase 3 s_curve: legacy --course s_curve route. Mirrors phase3_circle_stage0a
+# scaffolding but selects the s_curve course YAML so radius / target_speed /
+# course_ds invariants stay consistent (PR 3 round-2 fix F3).
+schema_version: 1
+kind: rl_train
+
+seed: null
+run_name: phase3_s_curve
+
+vehicle_ref: configs/vehicles/sedan.yaml
+dynamics_ref: configs/dynamics/linear_friction_circle_flat.yaml
+env_ref: configs/envs/tracking.yaml
+course_ref: configs/courses/s_curve.yaml
+agent_ref: configs/agents/rsl_rl/ppo_tracking.yaml
+runtime_ref: configs/runtime/local_paths.yaml
+
+overrides:
+  env:
+    scene:
+      num_envs: 128
+    spaces:
+      action_mode: steering_only
+  agent:
+    runner:
+      max_iterations: 200
+      experiment_name: phase3_s_curve

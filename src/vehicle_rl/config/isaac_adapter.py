@@ -773,6 +773,14 @@ def make_tracking_env_cfg(
     decimation = int(timing["decimation"])
     physics_dt = float(timing["physics_dt_s"])
 
+    # PhysX SimulationCfg gravity comes from the dynamics YAML's
+    # `gravity_mps2` (single positive scalar; SimulationCfg expects a
+    # 3-tuple in m/s^2 with the conventional negative-z sign). This
+    # mirrors what `make_simulator_kwargs` already exposes via
+    # `gravity` for the analytical VehicleSimulator path so PhysX and
+    # the analytical model see the same value (PR 3 round-2 fix F1a).
+    gravity_mps2 = float(dynamics_bundle["gravity_mps2"])
+
     cfg = TrackingEnvCfg()
     # --- top-level / DirectRLEnvCfg fields ---
     cfg.decimation = decimation
@@ -787,7 +795,7 @@ def make_tracking_env_cfg(
     cfg.sim = SimulationCfg(
         dt=physics_dt,
         render_interval=decimation,
-        gravity=(0.0, 0.0, -9.81),
+        gravity=(0.0, 0.0, -gravity_mps2),
     )
     # --- scene ---
     cfg.scene = InteractiveSceneCfg(
@@ -870,6 +878,12 @@ def make_tracking_env_cfg(
     # --- dynamics simulator kwargs (PR 3 round-1 fix, finding 1) ---
     cfg.dynamics_kwargs = make_simulator_kwargs(dynamics_bundle)
     cfg.a_front = float(vehicle_bundle["geometry"]["a_front_m"])
+
+    # PR 3 round-2 fix F1b: `steering_ratio` comes from the vehicle YAML
+    # via cfg, NOT from a module-level `vehicle_rl.assets.STEERING_RATIO`
+    # constant. Kept on cfg (not in dynamics_kwargs) because steering
+    # ratio is a vehicle property, not a tire/actuator coefficient.
+    cfg.steering_ratio = float(vehicle_bundle["steering"]["steering_ratio"])
 
     return cfg
 

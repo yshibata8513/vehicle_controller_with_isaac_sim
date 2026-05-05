@@ -32,7 +32,6 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
-from vehicle_rl.assets import STEERING_RATIO
 from vehicle_rl.controller import PIDSpeedController
 from vehicle_rl.envs.sensors import build_observation
 from vehicle_rl.envs.simulator import VehicleSimulator
@@ -151,6 +150,12 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     dynamics_kwargs: dict = MISSING
     a_front: float = MISSING
 
+    # --- vehicle-derived (steering kinematics) ---
+    # PR 3 round-2 fix F1b: previously read from `vehicle_rl.assets.STEERING_RATIO`
+    # at runtime; now sourced from the vehicle YAML via the factory so a
+    # different `configs/vehicles/*.yaml` actually changes the simulator.
+    steering_ratio: float = MISSING
+
 
 class TrackingEnv(DirectRLEnv):
     """Phase 3 path-tracking env. See `TrackingEnvCfg` for tunables."""
@@ -185,7 +190,7 @@ class TrackingEnv(DirectRLEnv):
         sim_kwargs = dict(self.cfg.dynamics_kwargs)
         self.vsim = VehicleSimulator(
             self.sim, self.sedan,
-            steering_ratio=STEERING_RATIO,
+            steering_ratio=float(self.cfg.steering_ratio),
             a_front=float(self.cfg.a_front),
             **sim_kwargs,
         )

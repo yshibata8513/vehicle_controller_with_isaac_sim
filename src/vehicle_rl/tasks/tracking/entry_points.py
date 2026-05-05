@@ -36,14 +36,14 @@ LEGACY_COURSE_TO_EXPERIMENT = {
     "circle": "configs/experiments/rl/phase3_circle_stage0a.yaml",
     "random_long": "configs/experiments/rl/phase3_random_long.yaml",
     "random_bank": "configs/experiments/rl/phase3_random_bank.yaml",
-    # s_curve / dlc / lemniscate don't have committed experiment YAMLs in PR
-    # 1; PR 4 will add them. For PR 3 we map them to the circle experiment
-    # and rely on the `--course` legacy override path in train_ppo.py to
-    # patch `cfg.course` after the factory builds the YAML defaults. This
-    # keeps the legacy CLI booting without needing new YAMLs in PR 3.
-    "s_curve": "configs/experiments/rl/phase3_circle_stage0a.yaml",
-    "dlc": "configs/experiments/rl/phase3_circle_stage0a.yaml",
-    "lemniscate": "configs/experiments/rl/phase3_circle_stage0a.yaml",
+    # PR 3 round-2 fix F3: dedicated experiment YAMLs for s_curve / dlc /
+    # lemniscate so `--course X` correctly selects the matching course
+    # bundle (radius / target_speed / course_ds derive from the course
+    # YAML the experiment refs). Previously these aliased to
+    # phase3_circle_stage0a, which silently trained on circle.
+    "s_curve": "configs/experiments/rl/phase3_s_curve.yaml",
+    "dlc": "configs/experiments/rl/phase3_dlc.yaml",
+    "lemniscate": "configs/experiments/rl/phase3_lemniscate.yaml",
 }
 
 
