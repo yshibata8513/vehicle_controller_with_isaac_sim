@@ -207,20 +207,114 @@ class DynamicsSchema:
     attitude_damper: AttitudeDamperSchema
 
 
+# --------------------------------------------------------------------------
+# Env nested schemas (PR 3): per-leaf strict validation for configs/envs/tracking.yaml.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class TimingSchema:
+    physics_dt_s: float
+    decimation: int
+    episode_length_s: float
+
+
+@dataclass
+class SceneSchema:
+    num_envs: int
+    env_spacing_m: float
+    replicate_physics: bool
+    clone_in_fabric: bool
+
+
+@dataclass
+class ObservationSchema:
+    imu_fields: list
+    include_pinion_angle: bool
+    include_path_errors: bool
+    include_plan: bool
+    include_world_pose: bool
+
+
+@dataclass
+class SpacesSchema:
+    action_mode: str
+    observation: ObservationSchema
+
+
+@dataclass
+class PlannerProjectionSchema:
+    search_radius_samples: int
+    max_index_jump_samples: int
+
+
+@dataclass
+class PlannerSchema:
+    plan_K: int
+    lookahead_ds_m: float
+    projection: PlannerProjectionSchema
+
+
+@dataclass
+class ResetSchema:
+    random_reset_along_path: bool
+    warm_start_velocity: bool
+
+
+@dataclass
+class ActionScalingSchema:
+    pinion_action_scale_rad: float
+
+
+@dataclass
+class SpeedControllerSchema:
+    enabled_when_action_mode: str
+    # `controller_ref:` is resolved by the loader into `controller:` containing
+    # the speed-PI bundle. Stored as a free dict so we don't accidentally lock
+    # in the speed_pi shape; `make_tracking_env_cfg` validates the inner shape.
+    controller: dict
+
+
+@dataclass
+class RewardSchema:
+    progress: float
+    alive: float
+    lateral: float
+    heading: float
+    speed: float
+    pinion_rate: float
+    jerk: float
+    termination: float
+    progress_clamp: list
+
+
+@dataclass
+class TerminationSchema:
+    max_lateral_error_m: float
+    max_roll_rad: float
+
+
+@dataclass
+class DiagnosticsSchema:
+    log_reward_terms: bool
+    log_state_action_terms: bool
+    log_projection_health: bool
+
+
 @dataclass
 class EnvSchema:
     schema_version: int
     task_id: str
-    timing: dict
-    scene: dict
-    spaces: dict
-    planner: dict
-    reset: dict
-    action_scaling: dict
-    speed_controller: dict
-    reward: dict
-    termination: dict
-    diagnostics: dict
+    timing: TimingSchema
+    scene: SceneSchema
+    spaces: SpacesSchema
+    planner: PlannerSchema
+    reset: ResetSchema
+    action_scaling: ActionScalingSchema
+    speed_controller: SpeedControllerSchema
+    reward: RewardSchema
+    termination: TerminationSchema
+    diagnostics: DiagnosticsSchema
 
 
 # Per-shape controller schemas. Each `type` discriminator selects exactly one.
@@ -273,12 +367,59 @@ def select_controller_schema(controller_bundle: dict) -> type:
     return _CONTROLLER_SCHEMAS_BY_TYPE[type_value]
 
 
+# --------------------------------------------------------------------------
+# Agent (rsl_rl PPO) nested schemas (PR 3).
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class AgentObsGroupsSchema:
+    policy: list
+    critic: list
+
+
+@dataclass
+class AgentRunnerSchema:
+    num_steps_per_env: int
+    max_iterations: int
+    save_interval: int
+    experiment_name: str
+    clip_actions: float
+    obs_groups: AgentObsGroupsSchema
+
+
+@dataclass
+class AgentPolicySchema:
+    init_noise_std: float
+    actor_obs_normalization: bool
+    critic_obs_normalization: bool
+    actor_hidden_dims: list
+    critic_hidden_dims: list
+    activation: str
+
+
+@dataclass
+class AgentAlgorithmSchema:
+    value_loss_coef: float
+    use_clipped_value_loss: bool
+    clip_param: float
+    entropy_coef: float
+    num_learning_epochs: int
+    num_mini_batches: int
+    learning_rate: float
+    schedule: str
+    gamma: float
+    lam: float
+    desired_kl: float
+    max_grad_norm: float
+
+
 @dataclass
 class AgentSchema:
     schema_version: int
-    runner: dict
-    policy: dict
-    algorithm: dict
+    runner: AgentRunnerSchema
+    policy: AgentPolicySchema
+    algorithm: AgentAlgorithmSchema
 
 
 # Per-shape experiment schemas. The PR 1 RL and classical experiment YAMLs
@@ -354,16 +495,32 @@ def select_experiment_schema(experiment_bundle: dict) -> type:
 
 __all__ = [
     "ActionLimitsSchema",
+    "ActionScalingSchema",
     "ActuatorLagSchema",
     "ActuatorSchema",
     "ActuatorsSchema",
+    "AgentAlgorithmSchema",
+    "AgentObsGroupsSchema",
+    "AgentPolicySchema",
+    "AgentRunnerSchema",
     "AgentSchema",
     "ArticulationSchema",
     "AssetSchema",
     "AttitudeDamperSchema",
     "ClassicalExperimentSchema",
+    "DiagnosticsSchema",
     "DynamicsSchema",
     "EnvSchema",
+    "ObservationSchema",
+    "PlannerProjectionSchema",
+    "PlannerSchema",
+    "ResetSchema",
+    "RewardSchema",
+    "SceneSchema",
+    "SpacesSchema",
+    "SpeedControllerSchema",
+    "TerminationSchema",
+    "TimingSchema",
     "FrictionSchema",
     "GeometrySchema",
     "JointsSchema",

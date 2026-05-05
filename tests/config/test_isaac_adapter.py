@@ -28,6 +28,10 @@ from vehicle_rl.config.isaac_adapter import (  # noqa: E402
     make_simulator_kwargs,
     make_vehicle_geometry,
 )
+from vehicle_rl.config.isaac_adapter import (  # noqa: E402
+    _derived_action_space,
+    _derived_observation_space,
+)
 from vehicle_rl.config.loader import (  # noqa: E402
     load_experiment,
     load_yaml_strict,
@@ -49,6 +53,22 @@ def _course_bundle(name: str) -> dict:
     raw = load_yaml_strict(REPO_ROOT / "configs" / "courses" / f"{name}.yaml")
     # resolve_refs handles `generator_ref:` for random_long / random_bank.
     return resolve_refs(raw, repo_root=REPO_ROOT)
+
+
+def _env_bundle() -> dict:
+    raw = load_yaml_strict(REPO_ROOT / "configs" / "envs" / "tracking.yaml")
+    return resolve_refs(raw, repo_root=REPO_ROOT)
+
+
+def _agent_bundle() -> dict:
+    raw = load_yaml_strict(
+        REPO_ROOT / "configs" / "agents" / "rsl_rl" / "ppo_tracking.yaml"
+    )
+    return resolve_refs(raw, repo_root=REPO_ROOT)
+
+
+def _controller_bundle() -> dict:
+    return load_yaml_strict(REPO_ROOT / "configs" / "controllers" / "speed_pi.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +576,271 @@ class TestExperimentBundleIntegration(unittest.TestCase):
         # Course bundle accepts the dispatch.
         path = build_path(bundle["course"], num_envs=1, device="cpu")
         self.assertTrue(path.is_loop)
+
+
+# ---------------------------------------------------------------------------
+# PR 3: env / agent factories. The isaac-free tests cover derived values and
+# schema validation; the gated tests construct the actual cfg objects.
+# ---------------------------------------------------------------------------
+
+
+class TestDerivedActionSpace(unittest.TestCase):
+    def test_steering_only_is_one(self):
+        self.assertEqual(_derived_action_space("steering_only"), 1)
+
+    def test_steering_and_accel_is_two(self):
+        self.assertEqual(_derived_action_space("steering_and_accel"), 2)
+
+    def test_unknown_action_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            _derived_action_space("yaw_torque")
+
+
+class TestDerivedObservationSpace(unittest.TestCase):
+    def test_default_yaml_is_39(self):
+        # Default tracking.yaml: 6 imu fields + pinion + 2 path errors + 0 world
+        # = 9 scalar; plan_K=10 * 3 channels = 30; total = 39.
+        self.assertEqual(_derived_observation_space(_env_bundle()), 39)
+
+    def test_world_pose_adds_three(self):
+        b = copy.deepcopy(_env_bundle())
+        b["spaces"]["observation"]["include_world_pose"] = True
+        self.assertEqual(_derived_observation_space(b), 42)
+
+    def test_no_plan_drops_plan_channels(self):
+        b = copy.deepcopy(_env_bundle())
+        b["spaces"]["observation"]["include_plan"] = False
+        # 9 scalar (unchanged) + 0 plan = 9.
+        self.assertEqual(_derived_observation_space(b), 9)
+
+    def test_changing_plan_K_scales_obs(self):
+        b = copy.deepcopy(_env_bundle())
+        b["planner"]["plan_K"] = 5
+        # 9 scalar + 5 * 3 = 24.
+        self.assertEqual(_derived_observation_space(b), 24)
+
+
+class TestEnvBundleSchema(unittest.TestCase):
+    """The PR 3-refined EnvSchema validates every leaf of tracking.yaml."""
+
+    def test_default_env_yaml_validates(self):
+        from vehicle_rl.config.schema import EnvSchema, validate_keys
+        validate_keys(_env_bundle(), EnvSchema)  # no raise
+
+    def test_unknown_reward_key_rejected(self):
+        from vehicle_rl.config.schema import EnvSchema, validate_keys
+        b = copy.deepcopy(_env_bundle())
+        b["reward"]["bogus_field"] = 1.0
+        with self.assertRaises(ValueError) as ctx:
+            validate_keys(b, EnvSchema)
+        self.assertIn("bogus_field", str(ctx.exception))
+
+    def test_missing_termination_max_lateral_error_rejected(self):
+        from vehicle_rl.config.schema import EnvSchema, validate_keys
+        b = copy.deepcopy(_env_bundle())
+        del b["termination"]["max_lateral_error_m"]
+        with self.assertRaises(ValueError) as ctx:
+            validate_keys(b, EnvSchema)
+        self.assertIn("max_lateral_error_m", str(ctx.exception))
+
+    def test_missing_top_level_key_rejected(self):
+        from vehicle_rl.config.schema import EnvSchema, validate_keys
+        b = copy.deepcopy(_env_bundle())
+        del b["reward"]
+        with self.assertRaises(ValueError) as ctx:
+            validate_keys(b, EnvSchema)
+        self.assertIn("reward", str(ctx.exception))
+
+
+class TestAgentBundleSchema(unittest.TestCase):
+    def test_default_agent_yaml_validates(self):
+        from vehicle_rl.config.schema import AgentSchema, validate_keys
+        validate_keys(_agent_bundle(), AgentSchema)
+
+    def test_unknown_algorithm_key_rejected(self):
+        from vehicle_rl.config.schema import AgentSchema, validate_keys
+        b = copy.deepcopy(_agent_bundle())
+        b["algorithm"]["bogus_field"] = 0.1
+        with self.assertRaises(ValueError) as ctx:
+            validate_keys(b, AgentSchema)
+        self.assertIn("bogus_field", str(ctx.exception))
+
+    def test_missing_runner_max_iterations_rejected(self):
+        from vehicle_rl.config.schema import AgentSchema, validate_keys
+        b = copy.deepcopy(_agent_bundle())
+        del b["runner"]["max_iterations"]
+        with self.assertRaises(ValueError) as ctx:
+            validate_keys(b, AgentSchema)
+        self.assertIn("max_iterations", str(ctx.exception))
+
+
+class TestEntryPointFactoryDispatch(unittest.TestCase):
+    """`vehicle_rl.tasks.tracking.entry_points` has the legacy course->yaml table."""
+
+    def test_legacy_circle_maps_to_phase3_circle_yaml(self):
+        from vehicle_rl.tasks.tracking.entry_points import LEGACY_COURSE_TO_EXPERIMENT
+        self.assertIn("circle", LEGACY_COURSE_TO_EXPERIMENT)
+        self.assertTrue(
+            LEGACY_COURSE_TO_EXPERIMENT["circle"].endswith("phase3_circle_stage0a.yaml")
+        )
+
+    def test_random_long_maps_to_phase3_random_long_yaml(self):
+        from vehicle_rl.tasks.tracking.entry_points import LEGACY_COURSE_TO_EXPERIMENT
+        self.assertTrue(
+            LEGACY_COURSE_TO_EXPERIMENT["random_long"].endswith("phase3_random_long.yaml")
+        )
+
+    def test_random_bank_maps_to_phase3_random_bank_yaml(self):
+        from vehicle_rl.tasks.tracking.entry_points import LEGACY_COURSE_TO_EXPERIMENT
+        self.assertTrue(
+            LEGACY_COURSE_TO_EXPERIMENT["random_bank"].endswith("phase3_random_bank.yaml")
+        )
+
+
+@unittest.skipUnless(_isaaclab_available(),
+                     "isaaclab not importable; skipping make_tracking_env_cfg test")
+class TestMakeTrackingEnvCfg(unittest.TestCase):
+    def test_default_yaml_returns_valid_cfg(self):
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+
+        env_b = _env_bundle()
+        course_b = _course_bundle("circle")
+        veh_b = _vehicle_bundle()
+        dyn_b = _dynamics_bundle()
+        cfg = make_tracking_env_cfg(
+            env_b, course_b,
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=veh_b, dynamics_bundle=dyn_b,
+        )
+        # Top-level fields match YAML.
+        self.assertEqual(int(cfg.scene.num_envs), 128)
+        self.assertEqual(float(cfg.episode_length_s), 25.0)
+        self.assertEqual(int(cfg.action_space), 1)         # steering_only
+        self.assertEqual(int(cfg.observation_space), 39)   # derived: 9 + 10*3
+        # Reward / termination / planner.
+        self.assertEqual(float(cfg.rew_progress), 1.0)
+        self.assertEqual(float(cfg.rew_alive), 0.1)
+        self.assertEqual(float(cfg.max_lateral_error), 4.0)
+        self.assertAlmostEqual(float(cfg.max_roll_rad), 1.047, places=4)
+        self.assertEqual(int(cfg.plan_K), 10)
+        self.assertEqual(float(cfg.lookahead_ds), 1.0)
+        # Course-derived.
+        self.assertEqual(cfg.course, "circle")
+        self.assertEqual(float(cfg.radius), 30.0)
+        self.assertEqual(float(cfg.target_speed), 10.0)
+        self.assertAlmostEqual(float(cfg.course_ds), 0.2, places=6)
+        # Dynamics-derived.
+        self.assertEqual(float(cfg.a_x_min), -5.0)
+        self.assertEqual(float(cfg.a_x_max), 3.0)
+        # PI gains from speed_pi controller bundle.
+        self.assertEqual(float(cfg.pi_kp), 1.0)
+        self.assertEqual(float(cfg.pi_ki), 0.3)
+        # Derived pinion_max.
+        self.assertAlmostEqual(float(cfg.pinion_max), 0.611 * 16.0, places=5)
+
+    def test_action_mode_steering_and_accel_yields_two(self):
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+        b = copy.deepcopy(_env_bundle())
+        b["spaces"]["action_mode"] = "steering_and_accel"
+        cfg = make_tracking_env_cfg(
+            b, _course_bundle("circle"),
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=_vehicle_bundle(), dynamics_bundle=_dynamics_bundle(),
+        )
+        self.assertEqual(int(cfg.action_space), 2)
+        self.assertFalse(cfg.steering_only)
+
+    def test_missing_reward_progress_rejected(self):
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+        b = copy.deepcopy(_env_bundle())
+        del b["reward"]["progress"]
+        with self.assertRaises(ValueError) as ctx:
+            make_tracking_env_cfg(
+                b, _course_bundle("circle"),
+                controller_bundle=_controller_bundle(),
+                vehicle_bundle=_vehicle_bundle(), dynamics_bundle=_dynamics_bundle(),
+            )
+        self.assertIn("progress", str(ctx.exception))
+
+    pass  # gated cases above; static signature gate moved to module level.
+
+
+class TestMakeTrackingEnvCfgSignature(unittest.TestCase):
+    """Static gate: every TrackingEnvCfg field is set by make_tracking_env_cfg.
+
+    Mirrors stage-2's `test_kwargs_signature_matches_simulator_init`. Reads
+    source files only, so it runs without isaaclab.
+    """
+
+    def test_make_tracking_env_cfg_signature_matches_TrackingEnvCfg(self):
+        env_src = (
+            REPO_ROOT / "src" / "vehicle_rl" / "envs" / "tracking_env.py"
+        ).read_text(encoding="utf-8")
+        adapter_src = (
+            REPO_ROOT / "src" / "vehicle_rl" / "config" / "isaac_adapter.py"
+        ).read_text(encoding="utf-8")
+        import re
+        cfg_class_match = re.search(
+            r"class TrackingEnvCfg\(DirectRLEnvCfg\):\n(.*?)(?=\nclass |\Z)",
+            env_src, re.DOTALL,
+        )
+        self.assertIsNotNone(cfg_class_match)
+        body = cfg_class_match.group(1)
+        field_re = re.compile(r"^    ([a-zA-Z_]\w*):\s+\S", re.MULTILINE)
+        fields = set(field_re.findall(body))
+        # state_space is intentionally constant 0; everything else must be
+        # assigned by the factory.
+        fields_to_check = fields - {"state_space"}
+        self.assertGreater(len(fields_to_check), 20,
+                           f"unexpectedly few fields scanned: {fields_to_check}")
+        for fname in fields_to_check:
+            self.assertIn(
+                f"cfg.{fname} =",
+                adapter_src,
+                f"make_tracking_env_cfg does not assign cfg.{fname}; "
+                f"either fill it in the factory or remove it from "
+                f"TrackingEnvCfg.",
+            )
+
+
+@unittest.skipUnless(_isaaclab_available(),
+                     "isaaclab not importable; skipping make_ppo_runner_cfg test")
+class TestMakePPORunnerCfg(unittest.TestCase):
+    def test_default_yaml_returns_valid_cfg(self):
+        from vehicle_rl.config.isaac_adapter import make_ppo_runner_cfg
+        cfg = make_ppo_runner_cfg(_agent_bundle())
+        # runner spot-checks
+        self.assertEqual(int(cfg.num_steps_per_env), 64)
+        self.assertEqual(int(cfg.max_iterations), 300)
+        self.assertEqual(int(cfg.save_interval), 50)
+        self.assertEqual(cfg.experiment_name, "vehicle_tracking_direct")
+        self.assertEqual(float(cfg.clip_actions), 1.0)
+        # policy spot-checks
+        self.assertAlmostEqual(float(cfg.policy.init_noise_std), 0.3, places=6)
+        self.assertEqual(list(cfg.policy.actor_hidden_dims), [256, 256])
+        self.assertEqual(list(cfg.policy.critic_hidden_dims), [256, 256])
+        self.assertEqual(cfg.policy.activation, "elu")
+        # algorithm spot-checks
+        self.assertAlmostEqual(float(cfg.algorithm.gamma), 0.995, places=6)
+        self.assertAlmostEqual(float(cfg.algorithm.lam), 0.95, places=6)
+        self.assertAlmostEqual(float(cfg.algorithm.learning_rate), 3.0e-4, places=8)
+        self.assertEqual(cfg.algorithm.schedule, "adaptive")
+
+    def test_unknown_nested_key_rejected(self):
+        from vehicle_rl.config.isaac_adapter import make_ppo_runner_cfg
+        b = copy.deepcopy(_agent_bundle())
+        b["policy"]["bogus_field"] = 1.0
+        with self.assertRaises(ValueError) as ctx:
+            make_ppo_runner_cfg(b)
+        self.assertIn("bogus_field", str(ctx.exception))
+
+    def test_missing_algorithm_block_rejected(self):
+        from vehicle_rl.config.isaac_adapter import make_ppo_runner_cfg
+        b = copy.deepcopy(_agent_bundle())
+        del b["algorithm"]
+        with self.assertRaises(ValueError) as ctx:
+            make_ppo_runner_cfg(b)
+        self.assertIn("algorithm", str(ctx.exception))
 
 
 if __name__ == "__main__":

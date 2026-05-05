@@ -87,6 +87,28 @@ from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
 # raises NameNotFound.
 import vehicle_rl.tasks  # noqa: F401
 
+# PR 3: the gym registry's env/agent cfg entry points are now 0-arg
+# factories that read `VEHICLE_RL_EXPERIMENT_YAML` (or fall back to the
+# stage 0a circle experiment). Map the legacy `--course X` CLI to the
+# matching experiment YAML so the legacy invocation keeps working until
+# PR 4 swaps to `--config <path>`.
+from vehicle_rl.tasks.tracking.entry_points import LEGACY_COURSE_TO_EXPERIMENT
+
+if args_cli.course is not None and "VEHICLE_RL_EXPERIMENT_YAML" not in os.environ:
+    if args_cli.course not in LEGACY_COURSE_TO_EXPERIMENT:
+        print(
+            f"[ERROR] unknown --course {args_cli.course!r}; "
+            f"known: {sorted(LEGACY_COURSE_TO_EXPERIMENT)}",
+            flush=True,
+        )
+        sys.exit(1)
+    os.environ["VEHICLE_RL_EXPERIMENT_YAML"] = LEGACY_COURSE_TO_EXPERIMENT[args_cli.course]
+    print(
+        f"[INFO] legacy --course {args_cli.course!r} -> "
+        f"VEHICLE_RL_EXPERIMENT_YAML={os.environ['VEHICLE_RL_EXPERIMENT_YAML']}",
+        flush=True,
+    )
+
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True

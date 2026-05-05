@@ -19,6 +19,7 @@ GPU contract (PLAN.md §0.5):
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import MISSING
 from types import SimpleNamespace
 
 import torch
@@ -31,16 +32,11 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
-from vehicle_rl.assets import (
-    COG_Z_DEFAULT,
-    DELTA_MAX_RAD,
-    SEDAN_CFG,
-    STEERING_RATIO,
-)
+from vehicle_rl.assets import STEERING_RATIO
 from vehicle_rl.controller import PIDSpeedController
 from vehicle_rl.envs.sensors import build_observation
 from vehicle_rl.envs.simulator import VehicleSimulator
-from vehicle_rl.envs.types import A_X_TARGET_MAX, A_X_TARGET_MIN, VehicleAction
+from vehicle_rl.envs.types import VehicleAction
 from vehicle_rl.planner import (
     Path,
     circle_path,
@@ -53,138 +49,81 @@ from vehicle_rl.planner import (
 )
 
 
-PINION_MAX = DELTA_MAX_RAD * STEERING_RATIO   # 0.611 * 16 ≈ 9.776 rad
-
-
 @configclass
 class TrackingEnvCfg(DirectRLEnvCfg):
-    """Stage 0 default: circle, μ=0.9, 64 envs, 50 Hz control."""
+    """Tracking env cfg. PR 3: tunable defaults moved to configs/envs/tracking.yaml.
 
-    # --- env timing ---
-    decimation = 4                        # 200 Hz physics, 50 Hz control
-    episode_length_s = 25.0               # ~1.3 laps of r=30, v=10 circle
+    Construct via `vehicle_rl.config.isaac_adapter.make_tracking_env_cfg(...)`
+    which fills every MISSING field from the resolved YAML bundles. The
+    gym registry's `env_cfg_entry_point` (vehicle_rl.tasks.tracking.entry_points
+    :tracking_env_cfg_factory) calls the factory at task-make time so legacy
+    `gym.make("Vehicle-Tracking-Direct-v0")` callers still work.
+    """
+
+    # --- env timing (filled by factory) ---
+    decimation: int = MISSING               # 200 Hz physics, 50 Hz control
+    episode_length_s: float = MISSING        # seconds
 
     # --- Gym spaces (DirectRLEnv treats int as Box of that dim) ---
-    # action_space = 1 for steering-only Stage 0a (default), 2 for full
-    # [pinion, a_x] action. Set this consistently with `steering_only`.
-    action_space = 1
-    # 9 scalar fields + K=10 plan points × 3 channels = 39.
-    # World-frame pos_xy and yaw are intentionally NOT included: the policy
-    # only ever needs path-relative quantities (`lateral_error`,
-    # `heading_error`, body-frame plan), and feeding absolute coordinates
-    # encourages it to memorize "at this position do that turn" instead of
-    # learning a translation/rotation-invariant tracking controller. See
-    # docs/phase3_training_review.md item 7.
-    observation_space = 9 + 3 * 10        # = 39
-    state_space = 0
+    action_space: int = MISSING
+    observation_space: int = MISSING
+    state_space: int = 0
 
-    # --- Simulation (matches Phase 1.5 / Phase 2: dt=1/200, gravity on) ---
-    sim: SimulationCfg = SimulationCfg(
-        dt=1.0 / 200.0,
-        render_interval=decimation,
-        gravity=(0.0, 0.0, -9.81),
-    )
+    # --- Simulation / Scene / Robot (filled by factory) ---
+    sim: SimulationCfg = MISSING
+    scene: InteractiveSceneCfg = MISSING
+    robot_cfg: ArticulationCfg = MISSING
 
-    # --- Scene ---
-    # env_spacing must clear the course extent. circle r=30 -> diameter 60 m;
-    # 200 m gives ~3x margin so neighbouring envs cannot interact through any
-    # future ground / sensor effects.
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=128, env_spacing=200.0, replicate_physics=True, clone_in_fabric=True
-    )
+    # --- Course (still uses string discriminator at runtime; the in-place
+    # YAML build path in `_build_path` is unchanged in PR 3 -- PR 4 will
+    # collapse this onto adapter.build_path). ---
+    course: str = MISSING
+    radius: float = MISSING
+    target_speed: float = MISSING
+    course_ds: float = MISSING
+    plan_K: int = MISSING
+    lookahead_ds: float = MISSING
 
-    # --- Robot ---
-    robot_cfg: ArticulationCfg = SEDAN_CFG.replace(prim_path="/World/envs/env_.*/Sedan")
-
-    # --- Course (Stage 0 hardcodes circle) ---
-    # Supported: "circle" (default Stage 0a), "s_curve", "dlc", "lemniscate",
-    # "random_long" (Phase 3 random-path single 20km path), and "random_bank"
-    # (Phase 3 random-path fixed bank of P paths sampled per reset). Both
-    # random_* courses read geometry from `random_path_cfg_path` (see
-    # configs/random_path.yaml); random_long uses the `phase1_long_path`
-    # subsection, random_bank uses `phase2_bank`.
-    course: str = "circle"
-    radius: float = 30.0
-    target_speed: float = 10.0
-    course_ds: float = 0.2
-    plan_K: int = 10
-    lookahead_ds: float = 1.0
-
-    # --- Random-path config (used when course is "random_long" or
-    # "random_bank") ---
-    # Path resolved relative to the repository root by `load_random_path_cfg`.
-    random_path_cfg_path: str = "configs/random_path.yaml"
+    # Legacy random-path config path; PR 4 deletes this and the runtime lookup.
+    random_path_cfg_path: str = MISSING
 
     # --- Projection (local-window argmin) ---
-    # half-window for Path.project; full window = 2W+1. With ds=0.2 and W=80
-    # the search covers ±16 m of arc length, which is >> per-step movement
-    # (~0.2 m at 10 m/s) and << half-loop length on every supported course.
-    # NOTE: only effective for built-in courses. For `course="random_long"`,
-    # the YAML `projection.search_radius_samples` overrides this default
-    # (cached on `self._projection_search_radius_samples` at __init__).
-    projection_search_radius_samples: int = 80
-    # Hard cap on per-step |delta_idx|; values above this count as a
-    # diagnostic violation (logged, not corrected). Reset envs always
-    # re-seed `_nearest_idx`, so a violation flags either branch confusion
-    # or a numerically broken projection.
-    # NOTE: only effective for built-in courses; YAML
-    # `projection.max_index_jump_samples` overrides for random_long.
-    projection_max_index_jump_samples: int = 120
+    projection_search_radius_samples: int = MISSING
+    projection_max_index_jump_samples: int = MISSING
 
-    # --- Friction (Stage 0: fixed) ---
-    mu_default: float = 0.9
+    # --- Friction ---
+    mu_default: float = MISSING
 
     # --- Action limits ---
-    # `pinion_max` is the URDF physical limit (≈9.78 rad). For training we
-    # rescale [-1, 1] to a smaller `pinion_action_scale` so that the
-    # policy's exploration noise (init_noise_std=0.3) maps to realistic
-    # steering deltas. r=30 circle at 10 m/s needs only ±1.4 rad pinion
-    # (≈5° steer); 3 rad gives 2× headroom for low-μ corrections without
-    # letting noisy random actions saturate the steering.
-    pinion_max: float = PINION_MAX                     # physical clip (safety)
-    pinion_action_scale: float = 3.0                   # action=±1 → ±3 rad pinion
-    a_x_max: float = A_X_TARGET_MAX                    # +3.0 m/s^2
-    a_x_min: float = A_X_TARGET_MIN                    # -5.0 m/s^2
+    pinion_max: float = MISSING                       # physical clip (safety)
+    pinion_action_scale: float = MISSING              # action=±1 → ±N rad pinion
+    a_x_max: float = MISSING                           # m/s^2
+    a_x_min: float = MISSING                           # m/s^2
 
     # --- Stage 0a: steering-only training ---
-    # When True, the policy outputs only the steering action; longitudinal
-    # control is handled by an internal PI controller targeting `target_speed`.
-    # `action_space` must be set to 1 in the cfg subclass (or via CLI) when
-    # using steering_only=True. Per docs/phase3_training_review.md item 1:
-    # learning to corner is the harder half; freezing speed first lets the
-    # policy converge on steering before the action space doubles.
-    steering_only: bool = True
-    pi_kp: float = 1.0
-    pi_ki: float = 0.3
+    steering_only: bool = MISSING
+    pi_kp: float = MISSING
+    pi_ki: float = MISSING
 
     # --- Reset distribution ---
-    # When True, each reset places the vehicle at a uniformly random
-    # path index (yaw aligned with path tangent, velocity warm-started
-    # along that tangent). Distributes experience across the whole course
-    # rather than concentrating it near path[0] -- review item 2.
-    random_reset_along_path: bool = True
+    random_reset_along_path: bool = MISSING
 
-    # --- Reward weights (sign baked in: progress/alive positive, others negative) ---
-    # Per docs/phase3_training_review.md item 3, the dominant positive term
-    # is `progress_norm = Δs / (target_speed × control_dt)`: at perfect
-    # tracking it equals 1.0 per step, giving a clear directional gradient
-    # ("move forward along the path"). Alive bonus is reduced to a small
-    # baseline so the policy can't just camp -- it has to actually progress.
-    rew_progress: float = 1.0              # × Δs / (target_speed × control_dt)
-    rew_alive: float = 0.1                 # small baseline so reset envs don't dominate
-    rew_lateral: float = -0.2              # × lateral_error^2
-    rew_heading: float = -0.3              # × heading_error^2
-    rew_speed: float = -0.01               # × (vx - v_target)^2
-    rew_pinion_rate: float = -0.01         # × (Δaction[0])^2 in [-1,1]
-    rew_jerk: float = -0.001               # × (Δaction[1])^2 in [-1,1]
-    rew_termination: float = -10.0         # one-shot on early termination
+    # --- Reward weights ---
+    rew_progress: float = MISSING
+    rew_alive: float = MISSING
+    rew_lateral: float = MISSING
+    rew_heading: float = MISSING
+    rew_speed: float = MISSING
+    rew_pinion_rate: float = MISSING
+    rew_jerk: float = MISSING
+    rew_termination: float = MISSING
 
     # --- Termination thresholds ---
-    max_lateral_error: float = 4.0         # m
-    max_roll_rad: float = 1.047            # 60 deg
+    max_lateral_error: float = MISSING       # m
+    max_roll_rad: float = MISSING            # rad
 
     # --- Initial pose ---
-    cog_z: float = COG_Z_DEFAULT
+    cog_z: float = MISSING
 
 
 class TrackingEnv(DirectRLEnv):

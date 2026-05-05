@@ -25,7 +25,10 @@ import os
 from typing import Any
 
 from vehicle_rl.config.schema import (
+    AgentSchema,
     DynamicsSchema,
+    EnvSchema,
+    SpeedPIControllerSchema,
     VehicleSchema,
     validate_keys,
 )
@@ -608,11 +611,316 @@ def _pair(v: Any) -> tuple[float, float]:
     raise ValueError(f"expected 2-element list, got {v!r}")
 
 
+# ---------------------------------------------------------------------------
+# Env factory (PR 3)
+# ---------------------------------------------------------------------------
+
+
+_VALID_ACTION_MODES = ("steering_only", "steering_and_accel")
+
+
+def _derived_action_space(action_mode: str) -> int:
+    if action_mode == "steering_only":
+        return 1
+    if action_mode == "steering_and_accel":
+        return 2
+    raise ValueError(
+        f"spaces.action_mode must be one of {_VALID_ACTION_MODES}, got {action_mode!r}"
+    )
+
+
+def _derived_observation_space(env_bundle: dict[str, Any]) -> int:
+    """Compute observation_space dim from spaces.observation + planner.plan_K.
+
+    Per the plan ("## 注意点"): observation_space = scalar_fields + plan_K * plan_channels.
+    Scalar fields = len(imu_fields) + (pinion_angle? 1 : 0) + (path_errors? 2 : 0)
+    + (world_pose? 3 : 0). Plan channels = 3 (x, y, v) when include_plan; else 0.
+    """
+    obs = env_bundle["spaces"]["observation"]
+    n_imu = len(obs["imu_fields"])
+    n_scalar = (
+        n_imu
+        + (1 if obs["include_pinion_angle"] else 0)
+        + (2 if obs["include_path_errors"] else 0)
+        + (3 if obs["include_world_pose"] else 0)
+    )
+    plan_K = int(env_bundle["planner"]["plan_K"])
+    plan_channels = 3 if obs["include_plan"] else 0
+    return n_scalar + plan_K * plan_channels
+
+
+def make_tracking_env_cfg(
+    env_bundle: dict[str, Any],
+    course_bundle: dict[str, Any],
+    controller_bundle: dict[str, Any] | None = None,
+    *,
+    vehicle_bundle: dict[str, Any] | None = None,
+    dynamics_bundle: dict[str, Any] | None = None,
+):
+    """Build a fully-configured `TrackingEnvCfg` from resolved YAML bundles.
+
+    Parameters
+    ----------
+    env_bundle:
+        Resolved `configs/envs/tracking.yaml` (with `speed_controller.controller_ref`
+        already resolved to `speed_controller.controller`).
+    course_bundle:
+        Resolved course bundle (any of `configs/courses/*.yaml`); becomes
+        `cfg.course` / `cfg.radius` / `cfg.target_speed` / `cfg.course_ds`.
+    controller_bundle:
+        Optional speed-PI controller bundle (typically populated from
+        `env_bundle["speed_controller"]["controller"]`). When None and the
+        action_mode is `steering_only`, the env_bundle's resolved controller
+        sub-bundle is used.
+    vehicle_bundle / dynamics_bundle:
+        Optional bundles needed for derived values (`pinion_max` from vehicle,
+        `a_x_min` / `a_x_max` from dynamics). When omitted, the loader's
+        committed defaults are used at adapter time.
+    """
+    validate_keys(env_bundle, EnvSchema)
+
+    # Pull controller bundle: caller may pass it explicitly, or we read the
+    # already-resolved sub-bundle from env_bundle.
+    if controller_bundle is None:
+        controller_bundle = env_bundle["speed_controller"]["controller"]
+    validate_keys(controller_bundle, SpeedPIControllerSchema)
+    if controller_bundle["type"] != "speed_pi":
+        raise ValueError(
+            f"speed_controller must be type=speed_pi, got {controller_bundle['type']!r}"
+        )
+
+    # Lazy isaaclab import + module-side imports (sedan, types, tracking_env_cfg).
+    import isaaclab.sim as sim_utils
+    from isaaclab.scene import InteractiveSceneCfg
+
+    from vehicle_rl.envs.tracking_env import TrackingEnvCfg
+
+    timing = env_bundle["timing"]
+    scene_b = env_bundle["scene"]
+    spaces = env_bundle["spaces"]
+    planner = env_bundle["planner"]
+    proj = planner["projection"]
+    reset_b = env_bundle["reset"]
+    action_scaling = env_bundle["action_scaling"]
+    reward = env_bundle["reward"]
+    termination = env_bundle["termination"]
+
+    action_mode = spaces["action_mode"]
+    action_space = _derived_action_space(action_mode)
+    obs_space = _derived_observation_space(env_bundle)
+
+    # Course-derived fields. `course_bundle["type"]` is the discriminator;
+    # builtin (circle / s_curve / dlc / lemniscate) carry `target_speed_mps`
+    # and `ds_m` directly; random_long / random_bank read from the resolved
+    # generator sub-bundle.
+    course_type = course_bundle["type"]
+    if course_type in {"circle", "lemniscate", "s_curve", "dlc"}:
+        course_ds = float(course_bundle["ds_m"])
+        target_speed = float(course_bundle["target_speed_mps"])
+        # `radius` is only meaningful for circle; default to 0 for others
+        # so the runtime code's existing branches stay unchanged.
+        radius = float(course_bundle.get("radius_m", 0.0))
+    elif course_type in {"random_long", "random_bank"}:
+        gen_g = course_bundle["generator"]["generator"]
+        course_ds = float(gen_g["ds_m"])
+        target_speed = float(gen_g["target_speed_mps"])
+        radius = 0.0
+    else:
+        raise ValueError(f"unknown course type: {course_type!r}")
+
+    # Derived pinion_max (from vehicle bundle if provided, else loader default).
+    if vehicle_bundle is not None:
+        pinion_max = derived_pinion_max(vehicle_bundle)
+    else:
+        # Pull from the canonical sedan YAML so adapter callers without a
+        # vehicle bundle still get a consistent value.
+        from vehicle_rl import VEHICLE_RL_ROOT
+        from vehicle_rl.config.loader import load_yaml_strict
+
+        vb = load_yaml_strict(
+            os.path.join(VEHICLE_RL_ROOT, "configs", "vehicles", "sedan.yaml")
+        )
+        pinion_max = derived_pinion_max(vb)
+
+    # Derived a_x_min / a_x_max.
+    if dynamics_bundle is not None:
+        a_x_min, a_x_max = make_action_limits(dynamics_bundle)
+    else:
+        from vehicle_rl import VEHICLE_RL_ROOT
+        from vehicle_rl.config.loader import load_yaml_strict
+
+        db = load_yaml_strict(
+            os.path.join(
+                VEHICLE_RL_ROOT,
+                "configs",
+                "dynamics",
+                "linear_friction_circle_flat.yaml",
+            )
+        )
+        a_x_min, a_x_max = make_action_limits(db)
+
+    # Sedan articulation (lazy because make_sedan_cfg needs Isaac Lab).
+    if vehicle_bundle is None:
+        from vehicle_rl import VEHICLE_RL_ROOT
+        from vehicle_rl.config.loader import load_yaml_strict
+
+        vehicle_bundle = load_yaml_strict(
+            os.path.join(VEHICLE_RL_ROOT, "configs", "vehicles", "sedan.yaml")
+        )
+    sedan_cfg = make_sedan_cfg(vehicle_bundle).replace(
+        prim_path=vehicle_bundle["asset"]["prim_path_train"],
+    )
+
+    decimation = int(timing["decimation"])
+    physics_dt = float(timing["physics_dt_s"])
+
+    cfg = TrackingEnvCfg()
+    # --- top-level / DirectRLEnvCfg fields ---
+    cfg.decimation = decimation
+    cfg.episode_length_s = float(timing["episode_length_s"])
+    cfg.action_space = action_space
+    cfg.observation_space = obs_space
+    cfg.state_space = 0
+
+    # --- sim ---
+    from isaaclab.sim import SimulationCfg
+
+    cfg.sim = SimulationCfg(
+        dt=physics_dt,
+        render_interval=decimation,
+        gravity=(0.0, 0.0, -9.81),
+    )
+    # --- scene ---
+    cfg.scene = InteractiveSceneCfg(
+        num_envs=int(scene_b["num_envs"]),
+        env_spacing=float(scene_b["env_spacing_m"]),
+        replicate_physics=bool(scene_b["replicate_physics"]),
+        clone_in_fabric=bool(scene_b["clone_in_fabric"]),
+    )
+    cfg.robot_cfg = sedan_cfg
+
+    # --- course (Stage-3 keeps the legacy course-name-based runtime branches
+    # in tracking_env._build_path; the YAML-driven `build_path` factory is
+    # used directly only by classical / play paths in PR 4. The env-cfg
+    # surface still carries course/radius/target_speed/course_ds so the
+    # existing _build_path code path keeps working). ---
+    cfg.course = course_type
+    cfg.radius = radius
+    cfg.target_speed = target_speed
+    cfg.course_ds = course_ds
+    cfg.plan_K = int(planner["plan_K"])
+    cfg.lookahead_ds = float(planner["lookahead_ds_m"])
+    # random_path_cfg_path: legacy-style path retained for tracking_env's
+    # in-place YAML load. PR 4 deletes the legacy file and the lookup.
+    cfg.random_path_cfg_path = "configs/random_path.yaml"
+
+    cfg.projection_search_radius_samples = int(proj["search_radius_samples"])
+    cfg.projection_max_index_jump_samples = int(proj["max_index_jump_samples"])
+
+    cfg.mu_default = (
+        float(dynamics_bundle["friction"]["mu_default"])
+        if dynamics_bundle is not None
+        else 0.9
+    )
+
+    cfg.pinion_max = float(pinion_max)
+    cfg.pinion_action_scale = float(action_scaling["pinion_action_scale_rad"])
+    cfg.a_x_max = float(a_x_max)
+    cfg.a_x_min = float(a_x_min)
+
+    cfg.steering_only = action_mode == "steering_only"
+    cfg.pi_kp = float(controller_bundle["kp"])
+    cfg.pi_ki = float(controller_bundle["ki"])
+
+    cfg.random_reset_along_path = bool(reset_b["random_reset_along_path"])
+
+    # --- reward ---
+    cfg.rew_progress = float(reward["progress"])
+    cfg.rew_alive = float(reward["alive"])
+    cfg.rew_lateral = float(reward["lateral"])
+    cfg.rew_heading = float(reward["heading"])
+    cfg.rew_speed = float(reward["speed"])
+    cfg.rew_pinion_rate = float(reward["pinion_rate"])
+    cfg.rew_jerk = float(reward["jerk"])
+    cfg.rew_termination = float(reward["termination"])
+
+    # --- termination ---
+    cfg.max_lateral_error = float(termination["max_lateral_error_m"])
+    cfg.max_roll_rad = float(termination["max_roll_rad"])
+
+    # --- initial pose / cog_z (read from vehicle bundle's geometry) ---
+    cfg.cog_z = float(vehicle_bundle["geometry"]["cog_z_m"])
+
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Agent (rsl_rl PPO) factory (PR 3)
+# ---------------------------------------------------------------------------
+
+
+def make_ppo_runner_cfg(agent_bundle: dict[str, Any]):
+    """Build a `RslRlOnPolicyRunnerCfg` from a resolved PPO agent bundle.
+
+    Bundle shape: `configs/agents/rsl_rl/ppo_tracking.yaml` (see AgentSchema).
+    """
+    validate_keys(agent_bundle, AgentSchema)
+
+    # Lazy isaaclab import.
+    from isaaclab_rl.rsl_rl import (
+        RslRlOnPolicyRunnerCfg,
+        RslRlPpoActorCriticCfg,
+        RslRlPpoAlgorithmCfg,
+    )
+
+    runner = agent_bundle["runner"]
+    policy = agent_bundle["policy"]
+    algo = agent_bundle["algorithm"]
+    obs_groups = runner["obs_groups"]
+
+    cfg = RslRlOnPolicyRunnerCfg(
+        num_steps_per_env=int(runner["num_steps_per_env"]),
+        max_iterations=int(runner["max_iterations"]),
+        save_interval=int(runner["save_interval"]),
+        experiment_name=str(runner["experiment_name"]),
+        clip_actions=float(runner["clip_actions"]),
+        obs_groups={
+            "policy": list(obs_groups["policy"]),
+            "critic": list(obs_groups["critic"]),
+        },
+        policy=RslRlPpoActorCriticCfg(
+            init_noise_std=float(policy["init_noise_std"]),
+            actor_obs_normalization=bool(policy["actor_obs_normalization"]),
+            critic_obs_normalization=bool(policy["critic_obs_normalization"]),
+            actor_hidden_dims=list(policy["actor_hidden_dims"]),
+            critic_hidden_dims=list(policy["critic_hidden_dims"]),
+            activation=str(policy["activation"]),
+        ),
+        algorithm=RslRlPpoAlgorithmCfg(
+            value_loss_coef=float(algo["value_loss_coef"]),
+            use_clipped_value_loss=bool(algo["use_clipped_value_loss"]),
+            clip_param=float(algo["clip_param"]),
+            entropy_coef=float(algo["entropy_coef"]),
+            num_learning_epochs=int(algo["num_learning_epochs"]),
+            num_mini_batches=int(algo["num_mini_batches"]),
+            learning_rate=float(algo["learning_rate"]),
+            schedule=str(algo["schedule"]),
+            gamma=float(algo["gamma"]),
+            lam=float(algo["lam"]),
+            desired_kl=float(algo["desired_kl"]),
+            max_grad_norm=float(algo["max_grad_norm"]),
+        ),
+    )
+    return cfg
+
+
 __all__ = [
     "build_path",
     "derived_pinion_max",
     "make_action_limits",
+    "make_ppo_runner_cfg",
     "make_sedan_cfg",
     "make_simulator_kwargs",
+    "make_tracking_env_cfg",
     "make_vehicle_geometry",
 ]
