@@ -53,22 +53,145 @@ def validate_keys(
 
 
 # ---------------------------------------------------------------------------
-# Documentation-only shells. Refined in PR 2-4 when each category is wired.
-# Fields here mirror configs/*/*.yaml top-level keys so validate_keys() can
-# at least catch typos at the section level.
+# Vehicle / dynamics nested schemas. PR 2 round-1 fix (review finding 5):
+# every nested dict is now a dataclass so validate_keys() catches typos and
+# missing keys at the leaf level (per the plan's "Strict Loader" rule).
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class AssetSchema:
+    usd_path: str
+    prim_path_train: str
+    prim_path_single: str
+
+
+@dataclass
+class JointsSchema:
+    steer_regex: str
+    wheel_regex: str
+    base_body: str
+    wheel_order: list
+
+
+@dataclass
+class GeometrySchema:
+    wheelbase_m: float
+    track_m: float
+    wheel_radius_m: float
+    wheel_width_m: float
+    cog_z_m: float
+    a_front_m: float
+
+
+@dataclass
+class MassSchema:
+    total_kg: float
+
+
+@dataclass
+class SteeringSchema:
+    delta_max_rad: float
+    steering_ratio: float
+
+
+@dataclass
+class RigidBodySchema:
+    max_linear_velocity: float
+    max_angular_velocity: float
+    max_depenetration_velocity: float
+    enable_gyroscopic_forces: bool
+
+
+@dataclass
+class ArticulationSchema:
+    enabled_self_collisions: bool
+    solver_position_iteration_count: int
+    solver_velocity_iteration_count: int
+    sleep_threshold: float
+    stabilization_threshold: float
+
+
+@dataclass
+class ActuatorSchema:
+    stiffness: float
+    damping: float
+    effort_limit_sim: float
+    velocity_limit_sim: float
+    friction: float
+
+
+@dataclass
+class ActuatorsSchema:
+    steer: ActuatorSchema
+    wheels: ActuatorSchema
+
+
+@dataclass
+class PhysxSchema:
+    rigid_body: RigidBodySchema
+    articulation: ArticulationSchema
+    actuators: ActuatorsSchema
 
 
 @dataclass
 class VehicleSchema:
     schema_version: int
     name: str
-    asset: dict
-    joints: dict
-    geometry: dict
-    mass: dict
-    steering: dict
-    physx: dict
+    asset: AssetSchema
+    joints: JointsSchema
+    geometry: GeometrySchema
+    mass: MassSchema
+    steering: SteeringSchema
+    physx: PhysxSchema
+
+
+@dataclass
+class FrictionSchema:
+    mu_default: float
+
+
+@dataclass
+class ActionLimitsSchema:
+    a_x_min_mps2: float
+    a_x_max_mps2: float
+
+
+@dataclass
+class ActuatorLagSchema:
+    tau_steer_s: float
+    tau_drive_s: float
+    tau_brake_s: float
+    initial_value: float
+
+
+@dataclass
+class LongForceSplitSchema:
+    accel: str
+    brake: str
+
+
+@dataclass
+class TireSchema:
+    type: str
+    cornering_stiffness_n_per_rad: float
+    eps_vlong_mps: float
+    longitudinal_force_split: LongForceSplitSchema
+
+
+@dataclass
+class NormalLoadSchema:
+    type: str
+    z_drift_kp: float
+    z_drift_kd: float
+
+
+@dataclass
+class AttitudeDamperSchema:
+    k_roll: float
+    c_roll: float
+    k_pitch: float
+    c_pitch: float
 
 
 @dataclass
@@ -76,12 +199,12 @@ class DynamicsSchema:
     schema_version: int
     model: str
     gravity_mps2: float
-    friction: dict
-    action_limits: dict
-    actuator_lag: dict
-    tire: dict
-    normal_load: dict
-    attitude_damper: dict
+    friction: FrictionSchema
+    action_limits: ActionLimitsSchema
+    actuator_lag: ActuatorLagSchema
+    tire: TireSchema
+    normal_load: NormalLoadSchema
+    attitude_damper: AttitudeDamperSchema
 
 
 @dataclass
@@ -230,13 +353,30 @@ def select_experiment_schema(experiment_bundle: dict) -> type:
 
 
 __all__ = [
+    "ActionLimitsSchema",
+    "ActuatorLagSchema",
+    "ActuatorSchema",
+    "ActuatorsSchema",
     "AgentSchema",
+    "ArticulationSchema",
+    "AssetSchema",
+    "AttitudeDamperSchema",
     "ClassicalExperimentSchema",
     "DynamicsSchema",
     "EnvSchema",
+    "FrictionSchema",
+    "GeometrySchema",
+    "JointsSchema",
+    "LongForceSplitSchema",
+    "MassSchema",
+    "NormalLoadSchema",
+    "PhysxSchema",
     "PurePursuitControllerSchema",
     "RLExperimentSchema",
+    "RigidBodySchema",
     "SpeedPIControllerSchema",
+    "SteeringSchema",
+    "TireSchema",
     "VehicleSchema",
     "select_controller_schema",
     "select_experiment_schema",

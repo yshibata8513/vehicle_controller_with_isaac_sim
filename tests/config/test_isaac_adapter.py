@@ -99,9 +99,29 @@ class TestMakeVehicleGeometry(unittest.TestCase):
         del b["mass"]["total_kg"]
         with self.assertRaises(ValueError) as ctx:
             make_vehicle_geometry(b)
-        # The leaf check fires before validate_keys would catch a missing
-        # nested field on `mass`, so the error message names total_kg.
+        # validate_keys against MassSchema (PR 2 round-1 strict refinement)
+        # raises with the missing key name.
         self.assertIn("total_kg", str(ctx.exception))
+
+    def test_unknown_nested_geometry_key_rejected(self):
+        # PR 2 round-1 fix (review finding 5): vehicle nested blocks now
+        # validate against per-shape schemas; unknown keys raise.
+        b = copy.deepcopy(_vehicle_bundle())
+        b["geometry"]["bogus"] = 1.0
+        with self.assertRaises(ValueError) as ctx:
+            make_vehicle_geometry(b)
+        self.assertIn("bogus", str(ctx.exception))
+
+    def test_a_front_m_surfaces_in_geometry(self):
+        # PR 2 round-1 fix (review finding 3): asymmetric a_front_m in YAML
+        # must reach make_vehicle_geometry verbatim (not silently
+        # recomputed as wheelbase / 2.0).
+        b = copy.deepcopy(_vehicle_bundle())
+        b["geometry"]["a_front_m"] = 1.20
+        g = make_vehicle_geometry(b)
+        self.assertEqual(g["a_front_m"], 1.20)
+        # And it differs from the default's wheelbase / 2.0 = 1.35.
+        self.assertNotEqual(g["a_front_m"], g["wheelbase_m"] / 2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -111,10 +131,11 @@ class TestMakeVehicleGeometry(unittest.TestCase):
 
 # The kwargs returned by `make_simulator_kwargs` must match the
 # VehicleSimulator.__init__ signature exactly (minus `sim`, `sedan`,
-# `device`, and `steering_ratio` which lives in the vehicle bundle).
+# `device`, `steering_ratio`, `a_front` which live in the vehicle bundle).
 _EXPECTED_SIM_KEYS = {
-    "tau_steer", "tau_drive", "tau_brake",
-    "cornering_stiffness",
+    "tau_steer", "tau_drive", "tau_brake", "actuator_initial_value",
+    "cornering_stiffness", "eps_vlong",
+    "fx_split_accel", "fx_split_brake",
     "z_drift_kp", "z_drift_kd",
     "k_roll", "c_roll", "k_pitch", "c_pitch",
     "mu_default", "gravity",
@@ -133,10 +154,50 @@ class TestMakeSimulatorKwargs(unittest.TestCase):
         self.assertEqual(kw["tau_steer"], 0.05)
         self.assertEqual(kw["tau_drive"], 0.20)
         self.assertEqual(kw["tau_brake"], 0.07)
+        self.assertEqual(kw["actuator_initial_value"], 0.0)
         self.assertEqual(kw["cornering_stiffness"], 60000.0)
+        self.assertEqual(kw["eps_vlong"], 0.01)
+        self.assertEqual(kw["fx_split_accel"], "rear")
+        self.assertEqual(kw["fx_split_brake"], "four_wheel")
         self.assertEqual(kw["mu_default"], 0.9)
         self.assertEqual(kw["gravity"], 9.81)
         self.assertEqual(kw["k_roll"], 80000.0)
+
+    def test_actuator_initial_value_flows_through(self):
+        # PR 2 round-1 fix (review finding 2): tweaking the YAML must
+        # surface in the returned kwargs, not be silently dropped.
+        b = copy.deepcopy(_dynamics_bundle())
+        b["actuator_lag"]["initial_value"] = 0.42
+        kw = make_simulator_kwargs(b)
+        self.assertEqual(kw["actuator_initial_value"], 0.42)
+
+    def test_eps_vlong_flows_through(self):
+        b = copy.deepcopy(_dynamics_bundle())
+        b["tire"]["eps_vlong_mps"] = 0.05
+        kw = make_simulator_kwargs(b)
+        self.assertEqual(kw["eps_vlong"], 0.05)
+
+    def test_longitudinal_force_split_flows_through(self):
+        b = copy.deepcopy(_dynamics_bundle())
+        b["tire"]["longitudinal_force_split"]["accel"] = "front"
+        b["tire"]["longitudinal_force_split"]["brake"] = "rear"
+        kw = make_simulator_kwargs(b)
+        self.assertEqual(kw["fx_split_accel"], "front")
+        self.assertEqual(kw["fx_split_brake"], "rear")
+
+    def test_unknown_fx_split_accel_rejected(self):
+        b = copy.deepcopy(_dynamics_bundle())
+        b["tire"]["longitudinal_force_split"]["accel"] = "all_wheel"
+        with self.assertRaises(ValueError) as ctx:
+            make_simulator_kwargs(b)
+        self.assertIn("longitudinal_force_split.accel", str(ctx.exception))
+
+    def test_unknown_fx_split_brake_rejected(self):
+        b = copy.deepcopy(_dynamics_bundle())
+        b["tire"]["longitudinal_force_split"]["brake"] = "diagonal"
+        with self.assertRaises(ValueError) as ctx:
+            make_simulator_kwargs(b)
+        self.assertIn("longitudinal_force_split.brake", str(ctx.exception))
 
     def test_kwargs_signature_matches_simulator_init(self):
         # We don't import VehicleSimulator (it pulls isaaclab); instead we
@@ -146,11 +207,16 @@ class TestMakeSimulatorKwargs(unittest.TestCase):
         src = (
             REPO_ROOT / "src" / "vehicle_rl" / "envs" / "simulator.py"
         ).read_text(encoding="utf-8")
+        # fx_split_* are str-typed (discriminator strings); everything else
+        # is float-typed. Match against either annotation form.
+        str_typed = {"fx_split_accel", "fx_split_brake"}
         for k in _EXPECTED_SIM_KEYS:
+            ann = "str" if k in str_typed else "float"
             self.assertIn(
-                f"        {k}: float",
+                f"        {k}: {ann}",
                 src,
-                f"VehicleSimulator.__init__ has no parameter named {k!r}",
+                f"VehicleSimulator.__init__ has no parameter named {k!r} "
+                f"with annotation {ann}",
             )
 
     def test_unknown_top_level_key_rejected(self):
@@ -173,6 +239,23 @@ class TestMakeSimulatorKwargs(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             make_simulator_kwargs(b)
         self.assertIn("tau_steer_s", str(ctx.exception))
+
+    def test_unknown_nested_key_rejected(self):
+        # PR 2 round-1 fix (review finding 5): nested dicts are now
+        # validated leaf-by-leaf; an unknown key under any nested block
+        # must raise.
+        b = copy.deepcopy(_dynamics_bundle())
+        b["tire"]["bogus_field"] = 1.0
+        with self.assertRaises(ValueError) as ctx:
+            make_simulator_kwargs(b)
+        self.assertIn("bogus_field", str(ctx.exception))
+
+    def test_missing_longitudinal_force_split_rejected(self):
+        b = copy.deepcopy(_dynamics_bundle())
+        del b["tire"]["longitudinal_force_split"]
+        with self.assertRaises(ValueError) as ctx:
+            make_simulator_kwargs(b)
+        self.assertIn("longitudinal_force_split", str(ctx.exception))
 
 
 class TestMakeActionLimits(unittest.TestCase):
@@ -361,6 +444,58 @@ class TestMakeSedanCfg(unittest.TestCase):
 # Schema integration: factories accept any bundle that loads cleanly via
 # load_experiment for the classical experiment YAMLs. No Isaac needed.
 # ---------------------------------------------------------------------------
+
+
+class TestAssetsLazyIsaacImport(unittest.TestCase):
+    """Review finding 4: `import vehicle_rl.assets` must not import isaaclab.
+
+    The package's `__getattr__` should defer the heavy import until
+    `SEDAN_CFG` is actually accessed.
+    """
+
+    def test_import_assets_does_not_pull_isaaclab(self):
+        # Run in a subprocess so we don't pollute this test process's
+        # already-loaded sys.modules. The child reports back via exit code.
+        import subprocess
+        import textwrap
+        code = textwrap.dedent(
+            """
+            import sys
+            # Force ImportError for any attempt to import isaaclab; if
+            # `import vehicle_rl.assets` triggers the import we'll see it.
+            class _Blocker:
+                def find_module(self, name, path=None):
+                    if name == 'isaaclab' or name.startswith('isaaclab.'):
+                        return self
+                    return None
+                def load_module(self, name):
+                    raise ImportError(
+                        f'eager isaaclab import: {name}'
+                    )
+            sys.meta_path.insert(0, _Blocker())
+            import vehicle_rl.assets  # noqa: F401
+            # Geometry constants must work without isaaclab.
+            assert vehicle_rl.assets.WHEELBASE == 2.7, vehicle_rl.assets.WHEELBASE
+            assert 'isaaclab' not in sys.modules
+            """
+        )
+        env = {
+            "PYTHONPATH": str(REPO_ROOT / "src"),
+        }
+        # Inherit the rest of the env so we keep PATH etc.
+        import os
+        full_env = {**os.environ, **env}
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            env=full_env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            proc.returncode, 0,
+            f"importing vehicle_rl.assets pulled isaaclab.\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+        )
 
 
 class TestExperimentBundleIntegration(unittest.TestCase):

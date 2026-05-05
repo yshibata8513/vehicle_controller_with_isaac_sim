@@ -212,9 +212,32 @@ class TrackingEnv(DirectRLEnv):
         # VehicleSimulator wraps the Articulation we registered in _setup_scene.
         # Constructing it after super().__init__() so SimulationContext + scene
         # are fully initialized.
+        # PR 3: route through make_simulator_kwargs(adapter)
+        # PR 2 round-1 fix: pass the full new VehicleSimulator kwarg set inline
+        # so the env keeps booting at PR 2 merge. Values mirror
+        # configs/dynamics/linear_friction_circle_flat.yaml +
+        # configs/vehicles/sedan.yaml so behaviour is unchanged from the
+        # implicit defaults the simulator used to carry.
         self.vsim = VehicleSimulator(
             self.sim, self.sedan,
+            steering_ratio=STEERING_RATIO,
+            tau_steer=0.05,
+            tau_drive=0.20,
+            tau_brake=0.07,
+            actuator_initial_value=0.0,
+            cornering_stiffness=60000.0,
+            eps_vlong=0.01,
+            fx_split_accel="rear",
+            fx_split_brake="four_wheel",
+            a_front=2.7 / 2.0,        # WHEELBASE / 2.0 (symmetric)
+            z_drift_kp=50000.0,
+            z_drift_kd=5000.0,
+            k_roll=80000.0,
+            c_roll=8000.0,
+            k_pitch=80000.0,
+            c_pitch=8000.0,
             mu_default=self.cfg.mu_default,
+            gravity=9.81,
         )
 
         # Course is shared across envs by default (broadcast Path(N, M)).

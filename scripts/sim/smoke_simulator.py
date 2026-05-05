@@ -74,12 +74,30 @@ def main():
     sedan = Articulation(cfg=sedan_cfg)
     sim.reset()
 
-    # steering_ratio=1.0 makes pinion_target numerically identical to
-    # delta_target -- the apples-to-apples comparison with run_phase1_5.py.
+    # PR 3: route through make_simulator_kwargs(adapter)
+    # PR 2 round-1 fix: pass the full new VehicleSimulator kwarg set inline
+    # so smoke_simulator keeps booting at PR 2 merge. steering_ratio=1.0 keeps
+    # the apples-to-apples comparison with run_phase1_5.py reference.
     vsim = VehicleSimulator(
         sim, sedan,
         steering_ratio=1.0,
+        tau_steer=0.05,
+        tau_drive=0.20,
+        tau_brake=0.07,
+        actuator_initial_value=0.0,
+        cornering_stiffness=60000.0,
+        eps_vlong=0.01,
+        fx_split_accel="rear",
+        fx_split_brake="four_wheel",
+        a_front=2.7 / 2.0,        # WHEELBASE / 2.0 (symmetric)
+        z_drift_kp=50000.0,
+        z_drift_kd=5000.0,
+        k_roll=80000.0,
+        c_roll=8000.0,
+        k_pitch=80000.0,
+        c_pitch=8000.0,
         mu_default=args_cli.mu,
+        gravity=GRAVITY,
     )
     state_gt = vsim.reset()
 

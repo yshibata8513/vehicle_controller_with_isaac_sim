@@ -83,12 +83,21 @@ class VehicleSimulator:
         device: torch.device | str | None = None,
         # Steering chain (pinion -> tire angle)
         steering_ratio: float,
-        # First-order lag time constants
+        # First-order lag time constants and initial value
         tau_steer: float,
         tau_drive: float,
         tau_brake: float,
+        actuator_initial_value: float,
         # Tire model
         cornering_stiffness: float,
+        eps_vlong: float,
+        # Longitudinal force split per axle. Each value is one of
+        # {"rear", "front", "four_wheel"}; the tire-frame Fx command is
+        # routed accordingly. Adapter validates the strings.
+        fx_split_accel: str,
+        fx_split_brake: str,
+        # Geometry: front-axle distance from CoG (vehicle YAML).
+        a_front: float,
         # Static normal load (z-drift PD just suppresses integration drift)
         z_drift_kp: float,
         z_drift_kd: float,
@@ -107,13 +116,20 @@ class VehicleSimulator:
         self.device = torch.device(device) if device is not None else sedan.device
         self.dt = sim.get_physics_dt()
 
-        # Vehicle constants from the asset module (single source of truth)
+        # Vehicle constants. WHEELBASE / TRACK / TOTAL_MASS / COG_Z_DEFAULT
+        # come from the assets module (single source of truth synced to YAML);
+        # `a_front` is now an explicit kwarg so non-symmetric weight
+        # distributions actually surface (review finding 3).
         self._mass = TOTAL_MASS
         self._L = WHEELBASE
         self._T = TRACK
         self._h_cg = COG_Z_DEFAULT
-        self._a_front = WHEELBASE / 2.0   # symmetric weight distribution
+        self._a_front = float(a_front)
         self._gravity = gravity
+
+        # Longitudinal-force split discriminators (validated by adapter).
+        self._fx_split_accel = str(fx_split_accel)
+        self._fx_split_brake = str(fx_split_brake)
 
         # Joint / body discovery (PLAN wheel order: FL, FR, RL, RR)
         self.joints = _SimulatorJointIds(
@@ -127,9 +143,15 @@ class VehicleSimulator:
         )
 
         # Actuator chain
-        self.steer_act = FirstOrderLagActuator(self.num_envs, self.device, tau_pos=tau_steer)
+        self.steer_act = FirstOrderLagActuator(
+            self.num_envs, self.device,
+            tau_pos=tau_steer,
+            initial_value=actuator_initial_value,
+        )
         self.drive_act = FirstOrderLagActuator(
-            self.num_envs, self.device, tau_pos=tau_drive, tau_neg=tau_brake
+            self.num_envs, self.device,
+            tau_pos=tau_drive, tau_neg=tau_brake,
+            initial_value=actuator_initial_value,
         )
         self.steering = FixedRatioSteeringModel(steering_ratio)
 
@@ -142,6 +164,7 @@ class VehicleSimulator:
         self.tire = LinearFrictionCircleTire(
             cornering_stiffness=cornering_stiffness,
             wheelbase=self._L, track=self._T, a_front=self._a_front, h_cg=self._h_cg,
+            eps_vlong=eps_vlong,
         )
         self.attitude = AttitudeDamper(
             k_roll=k_roll, c_roll=c_roll, k_pitch=k_pitch, c_pitch=c_pitch,
@@ -353,18 +376,35 @@ class VehicleSimulator:
         )
 
     def _distribute_fx(self, a_x_actual: Tensor) -> Tensor:
-        """RWD when accelerating (rear two wheels share), 4-wheel split when braking.
+        """Split tire-frame longitudinal force across [FL, FR, RL, RR] axles.
 
-        Returns (N, 4) tire-frame longitudinal force command in [FL, FR, RL, RR].
+        The accel/brake split is YAML-driven: each branch routes Fx to one
+        of {"rear", "front", "four_wheel"}. PR 2 round-1 fix replaces the
+        previously hard-coded RWD-accel / 4WD-brake behavior with the
+        adapter-validated `fx_split_accel` / `fx_split_brake` strings.
+        Returns (N, 4) tire-frame longitudinal force command.
         """
         Fx_total = self._mass * a_x_actual               # (N,)
         is_drive = (a_x_actual >= 0.0).unsqueeze(-1)     # (N, 1)
+        fx_drive = self._fx_split_to_per_wheel(Fx_total, self._fx_split_accel)
+        fx_brake = self._fx_split_to_per_wheel(Fx_total, self._fx_split_brake)
+        return torch.where(is_drive, fx_drive, fx_brake)
+
+    @staticmethod
+    def _fx_split_to_per_wheel(Fx_total: Tensor, split: str) -> Tensor:
+        """Translate one of {"rear", "front", "four_wheel"} to (N, 4) [FL, FR, RL, RR]."""
         zero = torch.zeros_like(Fx_total)
         half = Fx_total * 0.5
         quarter = Fx_total * 0.25
-        fx_drive = torch.stack([zero, zero, half, half], dim=-1)        # (N, 4)
-        fx_brake = torch.stack([quarter, quarter, quarter, quarter], dim=-1)
-        return torch.where(is_drive, fx_drive, fx_brake)
+        if split == "rear":
+            return torch.stack([zero, zero, half, half], dim=-1)
+        if split == "front":
+            return torch.stack([half, half, zero, zero], dim=-1)
+        if split == "four_wheel":
+            return torch.stack([quarter, quarter, quarter, quarter], dim=-1)
+        # The adapter validates this at construction time; this is a defensive
+        # fallback so any drift between adapter and simulator fails loudly.
+        raise ValueError(f"unknown longitudinal_force_split value: {split!r}")
 
     def _compute_slip_angles(self, veh_state: VehicleState, delta_actual: Tensor) -> Tensor:
         """Per-wheel slip angle (tire frame), shape (N, 4) [rad].

@@ -257,10 +257,12 @@ def main():
     )
 
     # Build VehicleSimulator kwargs from the dynamics YAML, then overlay the
-    # vehicle's steering_ratio (lives in vehicle_bundle, not dynamics) and
-    # the CLI mu (legacy --mu flag still supported in PR 2; PR 4 removes it).
+    # vehicle-side fields (steering_ratio, a_front) which live in
+    # vehicle_bundle, not dynamics. CLI --mu still wins over the YAML default
+    # (PR 4 removes the override).
     sim_kwargs = make_simulator_kwargs(dynamics_bundle)
     sim_kwargs["steering_ratio"] = steering_ratio
+    sim_kwargs["a_front"] = float(vehicle_bundle["geometry"]["a_front_m"])
     sim_kwargs["mu_default"] = float(args_cli.mu)
     vsim = VehicleSimulator(sim, sedan, **sim_kwargs)
     state_gt = vsim.reset(initial_pose=initial_pose)

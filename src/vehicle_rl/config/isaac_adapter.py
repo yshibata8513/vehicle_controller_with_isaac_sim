@@ -144,10 +144,14 @@ def derived_pinion_max(vehicle_bundle: dict[str, Any]) -> float:
 # Mapping from dynamics-bundle leaves to VehicleSimulator kwargs.
 # Defined here (not in VehicleSimulator) so the simulator stays a pure
 # physics object: the YAML schema -> kwargs translation is a config concern.
+_VALID_FX_SPLIT_VALUES = ("rear", "front", "four_wheel")
+
+
 def make_simulator_kwargs(dynamics_bundle: dict[str, Any]) -> dict[str, Any]:
     """Translate a resolved dynamics bundle into VehicleSimulator kwargs.
 
-    Returns the dynamics-side kwargs (tau_*, cornering_stiffness, z_drift_*,
+    Returns the dynamics-side kwargs (tau_*, actuator_initial_value,
+    cornering_stiffness, eps_vlong, longitudinal_force_split, z_drift_*,
     k_roll/pitch, c_roll/pitch, mu_default, gravity). The caller MUST also
     supply `steering_ratio` (lives in the vehicle bundle, not the dynamics
     bundle) before passing the dict into `VehicleSimulator(**kwargs)`:
@@ -158,6 +162,10 @@ def make_simulator_kwargs(dynamics_bundle: dict[str, Any]) -> dict[str, Any]:
 
     The split is intentional: `steering_ratio` is a vehicle property, not
     a tire / actuator coefficient, so it stays in the vehicle YAML.
+
+    PR 2 round-1 fix: `actuator_initial_value`, `eps_vlong`, and
+    `longitudinal_force_split` are now actually returned (they were
+    validated but silently dropped before).
     """
     validate_keys(dynamics_bundle, DynamicsSchema)
 
@@ -167,30 +175,32 @@ def make_simulator_kwargs(dynamics_bundle: dict[str, Any]) -> dict[str, Any]:
     normal = dynamics_bundle["normal_load"]
     attitude = dynamics_bundle["attitude_damper"]
 
-    # Sanity-check leaf keys we explicitly read so a typo in the YAML raises
-    # here instead of silently using a "default".
-    _required(friction, ["mu_default"], "friction")
-    _required(
-        lag,
-        ["tau_steer_s", "tau_drive_s", "tau_brake_s", "initial_value"],
-        "actuator_lag",
-    )
-    _required(
-        tire,
-        ["type", "cornering_stiffness_n_per_rad", "eps_vlong_mps",
-         "longitudinal_force_split"],
-        "tire",
-    )
-    _required(normal, ["type", "z_drift_kp", "z_drift_kd"], "normal_load")
-    _required(
-        attitude, ["k_roll", "c_roll", "k_pitch", "c_pitch"], "attitude_damper"
-    )
+    # Validate the longitudinal_force_split values at adapter time so a typo
+    # raises before any sim object is built. The simulator branches on these
+    # two strings; only "rear" / "front" / "four_wheel" are honoured.
+    fx_split = tire["longitudinal_force_split"]
+    accel_split = fx_split["accel"]
+    brake_split = fx_split["brake"]
+    if accel_split not in _VALID_FX_SPLIT_VALUES:
+        raise ValueError(
+            f"tire.longitudinal_force_split.accel must be one of "
+            f"{_VALID_FX_SPLIT_VALUES}, got {accel_split!r}"
+        )
+    if brake_split not in _VALID_FX_SPLIT_VALUES:
+        raise ValueError(
+            f"tire.longitudinal_force_split.brake must be one of "
+            f"{_VALID_FX_SPLIT_VALUES}, got {brake_split!r}"
+        )
 
     return {
         "tau_steer": float(lag["tau_steer_s"]),
         "tau_drive": float(lag["tau_drive_s"]),
         "tau_brake": float(lag["tau_brake_s"]),
+        "actuator_initial_value": float(lag["initial_value"]),
         "cornering_stiffness": float(tire["cornering_stiffness_n_per_rad"]),
+        "eps_vlong": float(tire["eps_vlong_mps"]),
+        "fx_split_accel": str(accel_split),
+        "fx_split_brake": str(brake_split),
         "z_drift_kp": float(normal["z_drift_kp"]),
         "z_drift_kd": float(normal["z_drift_kd"]),
         "k_roll": float(attitude["k_roll"]),
@@ -206,7 +216,6 @@ def make_action_limits(dynamics_bundle: dict[str, Any]) -> tuple[float, float]:
     """Return (a_x_min, a_x_max) from the dynamics bundle's `action_limits` block."""
     validate_keys(dynamics_bundle, DynamicsSchema)
     al = dynamics_bundle["action_limits"]
-    _required(al, ["a_x_min_mps2", "a_x_max_mps2"], "action_limits")
     return float(al["a_x_min_mps2"]), float(al["a_x_max_mps2"])
 
 
@@ -220,13 +229,6 @@ def make_vehicle_geometry(vehicle_bundle: dict[str, Any]) -> dict[str, float]:
     validate_keys(vehicle_bundle, VehicleSchema)
     g = vehicle_bundle["geometry"]
     m = vehicle_bundle["mass"]
-    _required(
-        g,
-        ["wheelbase_m", "track_m", "wheel_radius_m", "wheel_width_m",
-         "cog_z_m", "a_front_m"],
-        "geometry",
-    )
-    _required(m, ["total_kg"], "mass")
     return {
         "wheelbase_m": float(g["wheelbase_m"]),
         "track_m": float(g["track_m"]),
@@ -555,12 +557,21 @@ def _make_random_path_cfg(gen: dict[str, Any]):
 
 
 def _required(d: dict[str, Any], keys: list[str], where: str) -> None:
-    """Raise if any of `keys` is missing from mapping `d`. Allows extra keys."""
+    """Strict: raise if any of `keys` is missing or any unknown key is present.
+
+    PR 2 round-1 fix (review finding 5): the previous "allows extra keys"
+    behavior bypassed the plan's "Strict Loader" rule. Both directions are
+    now checked. Used for the random-path generator sub-bundle which lacks
+    a top-level dataclass schema (its dispatch is course-discriminated).
+    """
     if not isinstance(d, dict):
         raise ValueError(f"{where} must be a mapping, got {type(d).__name__}")
     missing = [k for k in keys if k not in d]
     if missing:
         raise ValueError(f"{where} is missing keys: {missing}")
+    unknown = sorted(set(d.keys()) - set(keys))
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {unknown}")
 
 
 def _required_top(
