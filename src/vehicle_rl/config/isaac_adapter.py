@@ -806,19 +806,21 @@ def make_tracking_env_cfg(
     )
     cfg.robot_cfg = sedan_cfg
 
-    # --- course (Stage-3 keeps the legacy course-name-based runtime branches
-    # in tracking_env._build_path; the YAML-driven `build_path` factory is
-    # used directly only by classical / play paths in PR 4. The env-cfg
-    # surface still carries course/radius/target_speed/course_ds so the
-    # existing _build_path code path keeps working). ---
+    # --- course ---
+    # PR 3 round-3 fix: the resolved YAML course bundle is now the single
+    # source of truth for `TrackingEnv._build_path`, which routes through
+    # `build_path(course_bundle, num_envs, device)`. The legacy fields
+    # (course / radius / target_speed / course_ds / random_path_cfg_path)
+    # are kept populated for back-compat with telemetry / CLI overrides
+    # in train_ppo.py and play.py; they are NO LONGER consumed by
+    # `_build_path`. PR 4 removes them entirely.
+    cfg.course_bundle = course_bundle
     cfg.course = course_type
     cfg.radius = radius
     cfg.target_speed = target_speed
     cfg.course_ds = course_ds
     cfg.plan_K = int(planner["plan_K"])
     cfg.lookahead_ds = float(planner["lookahead_ds_m"])
-    # random_path_cfg_path: legacy-style path retained for tracking_env's
-    # in-place YAML load. PR 4 deletes the legacy file and the lookup.
     cfg.random_path_cfg_path = "configs/random_path.yaml"
 
     cfg.projection_search_radius_samples = int(proj["search_radius_samples"])

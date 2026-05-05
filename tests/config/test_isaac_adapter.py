@@ -1294,5 +1294,102 @@ class TestRound2LegacyCourseDedicatedYamls(unittest.TestCase):
                 _os.environ["VEHICLE_RL_EXPERIMENT_YAML"] = prev
 
 
+# ---------------------------------------------------------------------------
+# PR 3 round-3 fix: _build_path routes through adapter.build_path
+# ---------------------------------------------------------------------------
+
+
+class TestRound3CourseBundleOnCfg(unittest.TestCase):
+    """Round-3 fix: cfg.course_bundle is the resolved YAML, drives _build_path."""
+
+    @unittest.skipUnless(_isaaclab_available(),
+                         "isaaclab not importable; gated factory test")
+    def test_course_bundle_reaches_cfg_circle(self):
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+
+        course_b = _course_bundle("circle")
+        cfg = make_tracking_env_cfg(
+            _env_bundle(), course_b,
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=_vehicle_bundle(),
+            dynamics_bundle=_dynamics_bundle(),
+        )
+        # cfg.course_bundle must be the same dict (or at least equal content).
+        self.assertEqual(cfg.course_bundle["type"], "circle")
+        self.assertEqual(
+            float(cfg.course_bundle["target_speed_mps"]),
+            float(course_b["target_speed_mps"]),
+        )
+        self.assertEqual(
+            float(cfg.course_bundle["radius_m"]),
+            float(course_b["radius_m"]),
+        )
+
+    @unittest.skipUnless(_isaaclab_available(),
+                         "isaaclab not importable; gated factory test")
+    def test_course_bundle_reaches_cfg_s_curve(self):
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+        course_b = _course_bundle("s_curve")
+        cfg = make_tracking_env_cfg(
+            _env_bundle(), course_b,
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=_vehicle_bundle(),
+            dynamics_bundle=_dynamics_bundle(),
+        )
+        self.assertEqual(cfg.course_bundle["type"], "s_curve")
+        # Required-by-planner s_curve fields must be carried.
+        for k in ("length_m", "amplitude_m", "n_cycles", "n_raw"):
+            self.assertIn(k, cfg.course_bundle)
+
+
+class TestRound3BuildPathLegacyCourses(unittest.TestCase):
+    """Round-3 fix: build_path(<resolved bundle>) works for s_curve/dlc/lemniscate.
+
+    These exercise the path-construction codepath that `_build_path` now
+    routes through. They run without isaaclab (pure planner generators).
+    """
+
+    def test_build_path_s_curve_resolved_bundle(self):
+        bundle = _course_bundle("s_curve")
+        path = build_path(bundle, num_envs=2, device="cpu")
+        self.assertFalse(path.is_loop)
+        self.assertEqual(path.num_envs, 2)
+        # Length should match length_m roughly (s_curve adds a small amount).
+        self.assertGreaterEqual(path.total_length, float(bundle["length_m"]))
+
+    def test_build_path_dlc_resolved_bundle(self):
+        bundle = _course_bundle("dlc")
+        path = build_path(bundle, num_envs=3, device="cpu")
+        self.assertFalse(path.is_loop)
+        self.assertEqual(path.num_envs, 3)
+
+    def test_build_path_lemniscate_resolved_bundle(self):
+        bundle = _course_bundle("lemniscate")
+        path = build_path(bundle, num_envs=1, device="cpu")
+        self.assertTrue(path.is_loop)
+        self.assertEqual(path.num_envs, 1)
+
+
+class TestRound3TrackingEnvDispatchesViaAdapter(unittest.TestCase):
+    """Round-3 fix: _build_path body must reference adapter.build_path
+    instead of the legacy planner generators / load_random_path_cfg."""
+
+    def test_build_path_no_longer_calls_legacy_planner_helpers(self):
+        env_src = (
+            REPO_ROOT / "src" / "vehicle_rl" / "envs" / "tracking_env.py"
+        ).read_text(encoding="utf-8")
+        # The string-dispatch chain must be gone.
+        self.assertNotIn("if self.cfg.course == \"circle\":", env_src)
+        self.assertNotIn("if self.cfg.course == \"s_curve\":", env_src)
+        self.assertNotIn("if self.cfg.course == \"dlc\":", env_src)
+        self.assertNotIn("if self.cfg.course == \"lemniscate\":", env_src)
+        # And the adapter routing must be present.
+        self.assertIn(
+            "from vehicle_rl.config.isaac_adapter import build_path",
+            env_src,
+            "_build_path no longer routes through adapter.build_path",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

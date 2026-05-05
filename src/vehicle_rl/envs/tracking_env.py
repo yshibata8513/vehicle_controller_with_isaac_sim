@@ -38,13 +38,6 @@ from vehicle_rl.envs.simulator import VehicleSimulator
 from vehicle_rl.envs.types import VehicleAction
 from vehicle_rl.planner import (
     Path,
-    circle_path,
-    dlc_path,
-    lemniscate_path,
-    load_random_path_cfg,
-    random_clothoid_path,
-    random_clothoid_path_bank,
-    s_curve_path,
 )
 
 
@@ -73,9 +66,18 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     scene: InteractiveSceneCfg = MISSING
     robot_cfg: ArticulationCfg = MISSING
 
-    # --- Course (still uses string discriminator at runtime; the in-place
-    # YAML build path in `_build_path` is unchanged in PR 3 -- PR 4 will
-    # collapse this onto adapter.build_path). ---
+    # --- Course ---
+    # PR 3 round-3 fix: `course_bundle` is the resolved YAML course dict from
+    # `configs/courses/<course>.yaml` (with `generator_ref` already resolved
+    # for random_*). It is the single source of truth for path construction;
+    # `_build_path` routes through `vehicle_rl.config.isaac_adapter.build_path`
+    # which handles every course type (circle / s_curve / dlc / lemniscate /
+    # random_long / random_bank) uniformly. The legacy fields below
+    # (`course`, `radius`, `target_speed`, `course_ds`, `random_path_cfg_path`)
+    # are kept as a convenience for telemetry / overrides on the existing
+    # CLI surface; they are NO LONGER read by `_build_path`. PR 4 drops them
+    # along with the legacy CLI overrides in train_ppo.py / play.py.
+    course_bundle: dict = MISSING
     course: str = MISSING
     radius: float = MISSING
     target_speed: float = MISSING
@@ -83,7 +85,8 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     plan_K: int = MISSING
     lookahead_ds: float = MISSING
 
-    # Legacy random-path config path; PR 4 deletes this and the runtime lookup.
+    # Legacy random-path config path; kept for back-compat with CLI overrides
+    # in train_ppo.py / play.py. PR 4 deletes this and the legacy YAML.
     random_path_cfg_path: str = MISSING
 
     # --- Projection (local-window argmin) ---
@@ -368,58 +371,48 @@ class TrackingEnv(DirectRLEnv):
     def _build_path(self):
         """Construct the requested course as a Path.
 
-        For `course="random_long"`, also caches the parsed YAML cfg on
-        `self._random_path_cfg` so `_reset_idx` can read the
-        `reset.end_margin_extra_m` and `phase1_long_path` fields.
+        PR 3 round-3 fix: routes every course type through
+        `vehicle_rl.config.isaac_adapter.build_path`, the YAML-driven
+        factory shared with the classical / play paths. The previous
+        `cfg.course == "..."` dispatch chain re-loaded the legacy
+        random_path.yaml and called planner generators with literals
+        from `cfg.<field>`; after PR 2 removed waypoint defaults this
+        broke s_curve / dlc / lemniscate at env construction.
+
+        For `random_long` / `random_bank` we additionally populate
+        `self._random_path_cfg` (read by `__init__` for projection
+        params and by `_reset_idx` for the end-margin / v_max), and for
+        `random_bank` we also set `_is_bank` / `_path_bank` /
+        `_env_path_idx` and wrap the bank's row 0 into a per-env Path
+        (the first `_reset_idx(_ALL_INDICES)` in `__init__` overwrites
+        these rows with freshly sampled bank rows).
         """
-        if self.cfg.course == "circle":
-            return circle_path(
-                radius=self.cfg.radius, target_speed=self.cfg.target_speed,
-                num_envs=self.num_envs, ds=self.cfg.course_ds, device=self.device,
-            )
-        if self.cfg.course == "s_curve":
-            return s_curve_path(
-                target_speed=self.cfg.target_speed,
-                num_envs=self.num_envs, ds=self.cfg.course_ds, device=self.device,
-            )
-        if self.cfg.course == "dlc":
-            return dlc_path(
-                target_speed=self.cfg.target_speed,
-                num_envs=self.num_envs, ds=self.cfg.course_ds, device=self.device,
-            )
-        if self.cfg.course == "lemniscate":
-            return lemniscate_path(
-                target_speed=self.cfg.target_speed,
-                num_envs=self.num_envs, ds=self.cfg.course_ds, device=self.device,
-            )
-        if self.cfg.course == "random_long":
-            rp_cfg = load_random_path_cfg(self.cfg.random_path_cfg_path)
-            if abs(rp_cfg.generator.ds - self.cfg.course_ds) > 1e-9:
-                raise ValueError(
-                    f"random_path generator.ds={rp_cfg.generator.ds} != "
-                    f"TrackingEnvCfg.course_ds={self.cfg.course_ds}"
-                )
+        from vehicle_rl.config.isaac_adapter import build_path
+
+        bundle = self.cfg.course_bundle
+        course_type = bundle["type"]
+
+        if course_type in ("circle", "s_curve", "dlc", "lemniscate"):
+            # Pure path; adapter validates & dispatches to the right generator.
+            return build_path(bundle, num_envs=self.num_envs, device=self.device)
+
+        if course_type == "random_long":
+            from vehicle_rl.config.isaac_adapter import _make_random_path_cfg
+
+            rp_cfg = _make_random_path_cfg(bundle["generator"])
             self._random_path_cfg = rp_cfg
             print(
                 f"[INFO] random_long: generating {rp_cfg.phase1_long_path.length_m:.0f} m path "
                 f"(seed={rp_cfg.generator.seed}, ds={rp_cfg.generator.ds}) ...",
                 flush=True,
             )
-            return random_clothoid_path(
-                cfg=rp_cfg,
-                num_envs=self.num_envs,
-                length_m=rp_cfg.phase1_long_path.length_m,
-                is_loop=rp_cfg.phase1_long_path.is_loop,
-                device=self.device,
-                seed_offset=0,
-            )
-        if self.cfg.course == "random_bank":
-            rp_cfg = load_random_path_cfg(self.cfg.random_path_cfg_path)
-            if abs(rp_cfg.generator.ds - self.cfg.course_ds) > 1e-9:
-                raise ValueError(
-                    f"random_path generator.ds={rp_cfg.generator.ds} != "
-                    f"TrackingEnvCfg.course_ds={self.cfg.course_ds}"
-                )
+            # Adapter dispatches to random_clothoid_path under the hood.
+            return build_path(bundle, num_envs=self.num_envs, device=self.device)
+
+        if course_type == "random_bank":
+            from vehicle_rl.config.isaac_adapter import _make_random_path_cfg
+
+            rp_cfg = _make_random_path_cfg(bundle["generator"])
             self._random_path_cfg = rp_cfg
             pb = rp_cfg.phase2_bank
             # `random_clothoid_path_bank` does not close the geometry, so
@@ -456,13 +449,8 @@ class TrackingEnv(DirectRLEnv):
                 f"ds={rp_cfg.generator.ds}) ...",
                 flush=True,
             )
-            bank = random_clothoid_path_bank(
-                cfg=rp_cfg,
-                num_paths=pb.num_paths,
-                length_m=pb.length_m,
-                is_loop=pb.is_loop,
-                device=self.device,
-            )
+            # Adapter returns the RandomPathBank (not a Path) for random_bank.
+            bank = build_path(bundle, num_envs=self.num_envs, device=self.device)
             self._is_bank = True
             self._path_bank = bank
             # Initial per-env path = bank[0] for all envs (placeholder; the
@@ -481,7 +469,8 @@ class TrackingEnv(DirectRLEnv):
                 is_loop=bank.is_loop,
                 ds_value=bank.ds,
             )
-        raise ValueError(f"unknown course {self.cfg.course}")
+
+        raise ValueError(f"unknown course type: {course_type!r}")
 
     # ------------------------------------------------------------------
     # DirectRLEnv API
