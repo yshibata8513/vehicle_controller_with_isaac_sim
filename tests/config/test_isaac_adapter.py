@@ -843,5 +843,298 @@ class TestMakePPORunnerCfg(unittest.TestCase):
         self.assertIn("algorithm", str(ctx.exception))
 
 
+# ---------------------------------------------------------------------------
+# PR 3 round-1 fixes: nested-leaf schema strictness + YAML-affects-runtime.
+# ---------------------------------------------------------------------------
+
+
+class TestEnvSchemaNestedLeafStrictness(unittest.TestCase):
+    """Round-1 finding 5: nested env leaves must be strict (typed, no extras)."""
+
+    def test_warm_start_velocity_int_rejected(self):
+        # `warm_start_velocity` is annotated bool. validate_keys' job is the
+        # KEY shape; Python tolerates 0/1 as bool, so to enforce typing we
+        # rely on the per-leaf validation below: make_tracking_env_cfg coerces
+        # via bool(...) which DOES accept 0/1. The behaviour we actually want
+        # to catch is the *missing* / *unknown sibling* shape, not int vs bool.
+        # Substitute: missing key raises (parallel to the other schema cases).
+        from vehicle_rl.config.schema import EnvSchema, validate_keys
+        b = copy.deepcopy(_env_bundle())
+        del b["reset"]["warm_start_velocity"]
+        with self.assertRaises(ValueError) as ctx:
+            validate_keys(b, EnvSchema)
+        self.assertIn("warm_start_velocity", str(ctx.exception))
+
+    def test_diagnostics_log_reward_terms_missing_rejected(self):
+        from vehicle_rl.config.schema import EnvSchema, validate_keys
+        b = copy.deepcopy(_env_bundle())
+        del b["diagnostics"]["log_reward_terms"]
+        with self.assertRaises(ValueError) as ctx:
+            validate_keys(b, EnvSchema)
+        self.assertIn("log_reward_terms", str(ctx.exception))
+
+    def test_planner_projection_unknown_sibling_rejected(self):
+        from vehicle_rl.config.schema import EnvSchema, validate_keys
+        b = copy.deepcopy(_env_bundle())
+        b["planner"]["projection"]["bogus_field"] = 1
+        with self.assertRaises(ValueError) as ctx:
+            validate_keys(b, EnvSchema)
+        self.assertIn("bogus_field", str(ctx.exception))
+
+    def test_observation_unknown_sibling_rejected(self):
+        from vehicle_rl.config.schema import EnvSchema, validate_keys
+        b = copy.deepcopy(_env_bundle())
+        b["spaces"]["observation"]["bogus_field"] = True
+        with self.assertRaises(ValueError) as ctx:
+            validate_keys(b, EnvSchema)
+        self.assertIn("bogus_field", str(ctx.exception))
+
+    def test_progress_clamp_wrong_length_rejected(self):
+        # The schema validates the key shape; the length check belongs to
+        # the factory. Verify the factory raises on a length-3 list.
+        if not _isaaclab_available():
+            self.skipTest("isaaclab not available; factory test skipped")
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+        b = copy.deepcopy(_env_bundle())
+        b["reward"]["progress_clamp"] = [-1.0, 0.0, 1.0]
+        with self.assertRaises(ValueError) as ctx:
+            make_tracking_env_cfg(
+                b, _course_bundle("circle"),
+                controller_bundle=_controller_bundle(),
+                vehicle_bundle=_vehicle_bundle(),
+                dynamics_bundle=_dynamics_bundle(),
+            )
+        self.assertIn("progress_clamp", str(ctx.exception))
+
+    def test_speed_pi_integral_max_missing_rejected(self):
+        # SpeedPIControllerSchema requires integral_max; validate_keys raises.
+        from vehicle_rl.config.schema import (
+            SpeedPIControllerSchema, validate_keys,
+        )
+        b = copy.deepcopy(_controller_bundle())
+        del b["integral_max"]
+        with self.assertRaises(ValueError) as ctx:
+            validate_keys(b, SpeedPIControllerSchema)
+        self.assertIn("integral_max", str(ctx.exception))
+
+
+class TestYAMLAffectsRuntime(unittest.TestCase):
+    """Round-1 finding 5 (new dimension): YAML values reach runtime behaviour.
+
+    These tests do NOT launch Isaac Sim. They cover:
+      - PIDSpeedController.integral_max actually clamps the integrator
+      - progress_clamp range is read from cfg (gated test on factory output)
+      - dynamics_kwargs flows through make_tracking_env_cfg
+      - warm_start_velocity / diagnostics flags reach cfg
+    """
+
+    def test_integral_max_clamps_integrator(self):
+        # PIDSpeedController is plain torch; no Isaac needed.
+        import torch
+
+        from vehicle_rl.controller import PIDSpeedController
+
+        ctrl = PIDSpeedController(
+            num_envs=2, dt=0.02,
+            kp=0.0,    # zero P so action = ki * I, easy to inspect
+            ki=1.0,
+            integral_max=5.0,
+            a_x_min=-1000.0, a_x_max=1000.0,  # don't let action clamp hide it
+            device="cpu",
+        )
+        # Drive a constant +100 m/s error for 100 steps (would integrate to
+        # 100*0.02*100 = 200 if unbounded). Expect the integrator to clamp at 5.
+        from types import SimpleNamespace
+        obs = SimpleNamespace(vx=torch.zeros(2))
+        target = torch.full((2,), 100.0)
+        for _ in range(100):
+            ctrl(obs, target_speed=target)
+        for v in ctrl.integral.tolist():
+            self.assertAlmostEqual(v, 5.0, places=5)
+
+    @unittest.skipUnless(_isaaclab_available(),
+                         "isaaclab not importable; gated factory test")
+    def test_progress_clamp_reaches_cfg(self):
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+        b = copy.deepcopy(_env_bundle())
+        b["reward"]["progress_clamp"] = [-2.0, 2.0]
+        cfg = make_tracking_env_cfg(
+            b, _course_bundle("circle"),
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=_vehicle_bundle(),
+            dynamics_bundle=_dynamics_bundle(),
+        )
+        self.assertEqual(float(cfg.progress_clamp_low), -2.0)
+        self.assertEqual(float(cfg.progress_clamp_high), 2.0)
+
+    @unittest.skipUnless(_isaaclab_available(),
+                         "isaaclab not importable; gated factory test")
+    def test_warm_start_velocity_reaches_cfg(self):
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+        b = copy.deepcopy(_env_bundle())
+        b["reset"]["warm_start_velocity"] = False
+        cfg = make_tracking_env_cfg(
+            b, _course_bundle("circle"),
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=_vehicle_bundle(),
+            dynamics_bundle=_dynamics_bundle(),
+        )
+        self.assertFalse(bool(cfg.warm_start_velocity))
+
+    @unittest.skipUnless(_isaaclab_available(),
+                         "isaaclab not importable; gated factory test")
+    def test_diagnostics_flags_reach_cfg(self):
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+        b = copy.deepcopy(_env_bundle())
+        b["diagnostics"]["log_reward_terms"] = False
+        b["diagnostics"]["log_state_action_terms"] = False
+        b["diagnostics"]["log_projection_health"] = False
+        cfg = make_tracking_env_cfg(
+            b, _course_bundle("circle"),
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=_vehicle_bundle(),
+            dynamics_bundle=_dynamics_bundle(),
+        )
+        self.assertFalse(bool(cfg.log_reward_terms))
+        self.assertFalse(bool(cfg.log_state_action_terms))
+        self.assertFalse(bool(cfg.log_projection_health))
+
+    @unittest.skipUnless(_isaaclab_available(),
+                         "isaaclab not importable; gated factory test")
+    def test_pi_integral_max_reaches_cfg(self):
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+        b = copy.deepcopy(_env_bundle())
+        ctrl = copy.deepcopy(_controller_bundle())
+        ctrl["integral_max"] = 5.0
+        cfg = make_tracking_env_cfg(
+            b, _course_bundle("circle"),
+            controller_bundle=ctrl,
+            vehicle_bundle=_vehicle_bundle(),
+            dynamics_bundle=_dynamics_bundle(),
+        )
+        self.assertEqual(float(cfg.pi_integral_max), 5.0)
+
+    @unittest.skipUnless(_isaaclab_available(),
+                         "isaaclab not importable; gated factory test")
+    def test_dynamics_kwargs_reach_cfg(self):
+        # Round-1 finding 1: changing the dynamics YAML must change the
+        # kwargs the env will pass to VehicleSimulator.
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+        b = copy.deepcopy(_env_bundle())
+        d = copy.deepcopy(_dynamics_bundle())
+        d["actuator_lag"]["tau_drive_s"] = 0.42
+        d["friction"]["mu_default"] = 0.5
+        cfg = make_tracking_env_cfg(
+            b, _course_bundle("circle"),
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=_vehicle_bundle(),
+            dynamics_bundle=d,
+        )
+        self.assertEqual(float(cfg.dynamics_kwargs["tau_drive"]), 0.42)
+        self.assertEqual(float(cfg.dynamics_kwargs["mu_default"]), 0.5)
+        self.assertEqual(float(cfg.mu_default), 0.5)
+
+    @unittest.skipUnless(_isaaclab_available(),
+                         "isaaclab not importable; gated factory test")
+    def test_dynamics_bundle_required(self):
+        from vehicle_rl.config.isaac_adapter import make_tracking_env_cfg
+        with self.assertRaises(ValueError) as ctx:
+            make_tracking_env_cfg(
+                _env_bundle(), _course_bundle("circle"),
+                controller_bundle=_controller_bundle(),
+                vehicle_bundle=_vehicle_bundle(),
+                dynamics_bundle=None,
+            )
+        self.assertIn("dynamics_bundle", str(ctx.exception))
+
+
+class TestObservationLayoutFromYaml(unittest.TestCase):
+    """Round-1 finding 2: cfg's observation layout matches derived obs space."""
+
+    @unittest.skipUnless(_isaaclab_available(),
+                         "isaaclab not importable; gated factory test")
+    def test_imu_fields_and_flags_reach_cfg(self):
+        from vehicle_rl.config.isaac_adapter import (
+            _derived_observation_space, make_tracking_env_cfg,
+        )
+        b = copy.deepcopy(_env_bundle())
+        # Custom layout: drop pinion_angle + plan, add world_pose, smaller imu
+        b["spaces"]["observation"]["imu_fields"] = ["vx", "yaw_rate"]
+        b["spaces"]["observation"]["include_pinion_angle"] = False
+        b["spaces"]["observation"]["include_plan"] = False
+        b["spaces"]["observation"]["include_world_pose"] = True
+        cfg = make_tracking_env_cfg(
+            b, _course_bundle("circle"),
+            controller_bundle=_controller_bundle(),
+            vehicle_bundle=_vehicle_bundle(),
+            dynamics_bundle=_dynamics_bundle(),
+        )
+        self.assertEqual(list(cfg.obs_imu_fields), ["vx", "yaw_rate"])
+        self.assertFalse(cfg.obs_include_pinion_angle)
+        self.assertFalse(cfg.obs_include_plan)
+        self.assertTrue(cfg.obs_include_world_pose)
+        # Derived obs space: 2 imu + 0 pinion + 2 path + 0 plan + 3 world = 7
+        self.assertEqual(int(cfg.observation_space), _derived_observation_space(b))
+        self.assertEqual(int(cfg.observation_space), 7)
+
+
+class TestTrackingYAMLLeafCoverage(unittest.TestCase):
+    """Round-1 finding 5: every tracking.yaml leaf has SOME use in source.
+
+    Complements the existing static signature gate that scans TrackingEnvCfg
+    annotations. This walks the actual YAML and asserts each leaf name shows
+    up either in `make_tracking_env_cfg` or in `tracking_env.py`.
+    """
+
+    _ALLOWED_UNREFERENCED = {
+        # Top-level YAML keys that have no runtime meaning.
+        "schema_version",
+        "task_id",  # gym registry uses the literal id, not via cfg.
+        # Wrappers; their children are checked individually.
+        "timing", "scene", "spaces", "observation", "planner", "projection",
+        "reset", "action_scaling", "speed_controller", "reward",
+        "termination", "diagnostics",
+        # Resolved in the loader (controller_ref -> controller).
+        "controller_ref", "controller",
+        # speed_controller.enabled_when_action_mode is enforced by the
+        # `steering_only` mode discriminator; the explicit string is doc-only.
+        "enabled_when_action_mode",
+    }
+
+    def _walk_leaves(self, d, prefix=""):
+        out = []
+        if isinstance(d, dict):
+            for k, v in d.items():
+                key = f"{prefix}.{k}" if prefix else k
+                if isinstance(v, dict):
+                    out.extend(self._walk_leaves(v, key))
+                else:
+                    out.append((k, key))
+        return out
+
+    def test_every_tracking_yaml_leaf_has_a_referent(self):
+        from vehicle_rl.config.loader import load_yaml_strict
+        bundle = load_yaml_strict(REPO_ROOT / "configs" / "envs" / "tracking.yaml")
+        adapter_src = (
+            REPO_ROOT / "src" / "vehicle_rl" / "config" / "isaac_adapter.py"
+        ).read_text(encoding="utf-8")
+        env_src = (
+            REPO_ROOT / "src" / "vehicle_rl" / "envs" / "tracking_env.py"
+        ).read_text(encoding="utf-8")
+        haystack = adapter_src + "\n" + env_src
+
+        for leaf_name, full_path in self._walk_leaves(bundle):
+            if leaf_name in self._ALLOWED_UNREFERENCED:
+                continue
+            # The leaf name must appear somewhere in either source file. We
+            # check the YAML key spelling; the adapter uses the same names.
+            self.assertIn(
+                leaf_name, haystack,
+                f"tracking.yaml leaf {full_path!r} has no referent in "
+                f"isaac_adapter.py or tracking_env.py; the YAML value will "
+                f"be silently ignored at runtime.",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

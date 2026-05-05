@@ -698,12 +698,14 @@ def make_tracking_env_cfg(
     timing = env_bundle["timing"]
     scene_b = env_bundle["scene"]
     spaces = env_bundle["spaces"]
+    obs_spec = spaces["observation"]
     planner = env_bundle["planner"]
     proj = planner["projection"]
     reset_b = env_bundle["reset"]
     action_scaling = env_bundle["action_scaling"]
     reward = env_bundle["reward"]
     termination = env_bundle["termination"]
+    diagnostics = env_bundle["diagnostics"]
 
     action_mode = spaces["action_mode"]
     action_space = _derived_action_space(action_mode)
@@ -742,22 +744,19 @@ def make_tracking_env_cfg(
         )
         pinion_max = derived_pinion_max(vb)
 
-    # Derived a_x_min / a_x_max.
-    if dynamics_bundle is not None:
-        a_x_min, a_x_max = make_action_limits(dynamics_bundle)
-    else:
-        from vehicle_rl import VEHICLE_RL_ROOT
-        from vehicle_rl.config.loader import load_yaml_strict
-
-        db = load_yaml_strict(
-            os.path.join(
-                VEHICLE_RL_ROOT,
-                "configs",
-                "dynamics",
-                "linear_friction_circle_flat.yaml",
-            )
+    # PR 3 round-1 fix (review finding 1): dynamics_bundle is now REQUIRED.
+    # Falling back to a default YAML on the disk hid mismatched experiments
+    # (e.g. an experiment that swaps in a different dynamics YAML would have
+    # silently used the canonical defaults). Callers MUST pass the resolved
+    # dynamics bundle.
+    if dynamics_bundle is None:
+        raise ValueError(
+            "make_tracking_env_cfg: dynamics_bundle is required. "
+            "Pass the resolved dynamics bundle (e.g. via "
+            "load_experiment(...)['dynamics']) so dynamics literals come "
+            "from YAML, not code defaults."
         )
-        a_x_min, a_x_max = make_action_limits(db)
+    a_x_min, a_x_max = make_action_limits(dynamics_bundle)
 
     # Sedan articulation (lazy because make_sedan_cfg needs Isaac Lab).
     if vehicle_bundle is None:
@@ -817,11 +816,7 @@ def make_tracking_env_cfg(
     cfg.projection_search_radius_samples = int(proj["search_radius_samples"])
     cfg.projection_max_index_jump_samples = int(proj["max_index_jump_samples"])
 
-    cfg.mu_default = (
-        float(dynamics_bundle["friction"]["mu_default"])
-        if dynamics_bundle is not None
-        else 0.9
-    )
+    cfg.mu_default = float(dynamics_bundle["friction"]["mu_default"])
 
     cfg.pinion_max = float(pinion_max)
     cfg.pinion_action_scale = float(action_scaling["pinion_action_scale_rad"])
@@ -831,8 +826,10 @@ def make_tracking_env_cfg(
     cfg.steering_only = action_mode == "steering_only"
     cfg.pi_kp = float(controller_bundle["kp"])
     cfg.pi_ki = float(controller_bundle["ki"])
+    cfg.pi_integral_max = float(controller_bundle["integral_max"])
 
     cfg.random_reset_along_path = bool(reset_b["random_reset_along_path"])
+    cfg.warm_start_velocity = bool(reset_b["warm_start_velocity"])
 
     # --- reward ---
     cfg.rew_progress = float(reward["progress"])
@@ -843,13 +840,36 @@ def make_tracking_env_cfg(
     cfg.rew_pinion_rate = float(reward["pinion_rate"])
     cfg.rew_jerk = float(reward["jerk"])
     cfg.rew_termination = float(reward["termination"])
+    pclamp = reward["progress_clamp"]
+    if not (isinstance(pclamp, (list, tuple)) and len(pclamp) == 2):
+        raise ValueError(
+            f"reward.progress_clamp must be a length-2 list, got {pclamp!r}"
+        )
+    cfg.progress_clamp_low = float(pclamp[0])
+    cfg.progress_clamp_high = float(pclamp[1])
 
     # --- termination ---
     cfg.max_lateral_error = float(termination["max_lateral_error_m"])
     cfg.max_roll_rad = float(termination["max_roll_rad"])
 
+    # --- diagnostics ---
+    cfg.log_reward_terms = bool(diagnostics["log_reward_terms"])
+    cfg.log_state_action_terms = bool(diagnostics["log_state_action_terms"])
+    cfg.log_projection_health = bool(diagnostics["log_projection_health"])
+
     # --- initial pose / cog_z (read from vehicle bundle's geometry) ---
     cfg.cog_z = float(vehicle_bundle["geometry"]["cog_z_m"])
+
+    # --- observation layout (from spaces.observation) ---
+    cfg.obs_imu_fields = list(obs_spec["imu_fields"])
+    cfg.obs_include_pinion_angle = bool(obs_spec["include_pinion_angle"])
+    cfg.obs_include_path_errors = bool(obs_spec["include_path_errors"])
+    cfg.obs_include_plan = bool(obs_spec["include_plan"])
+    cfg.obs_include_world_pose = bool(obs_spec["include_world_pose"])
+
+    # --- dynamics simulator kwargs (PR 3 round-1 fix, finding 1) ---
+    cfg.dynamics_kwargs = make_simulator_kwargs(dynamics_bundle)
+    cfg.a_front = float(vehicle_bundle["geometry"]["a_front_m"])
 
     return cfg
 

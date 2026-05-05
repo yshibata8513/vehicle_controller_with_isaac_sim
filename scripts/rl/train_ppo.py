@@ -94,7 +94,13 @@ import vehicle_rl.tasks  # noqa: F401
 # PR 4 swaps to `--config <path>`.
 from vehicle_rl.tasks.tracking.entry_points import LEGACY_COURSE_TO_EXPERIMENT
 
-if args_cli.course is not None and "VEHICLE_RL_EXPERIMENT_YAML" not in os.environ:
+# PR 3 round-1 fix (review finding 4): when `--course X` is supplied,
+# overwrite VEHICLE_RL_EXPERIMENT_YAML unconditionally so an unrelated stale
+# value (e.g. from a prior shell invocation pointing at random_bank) cannot
+# leak into a `--course circle` run. Precedence: CLI > env > default.
+# The env var must be set BEFORE `gym.make(...)` triggers the registry's
+# 0-arg factory (which reads the var), so we do it at module import time.
+if args_cli.course is not None:
     if args_cli.course not in LEGACY_COURSE_TO_EXPERIMENT:
         print(
             f"[ERROR] unknown --course {args_cli.course!r}; "
@@ -127,8 +133,13 @@ def _apply_cli_overrides(env_cfg, agent_cfg, args):
         env_cfg.scene.num_envs = args.num_envs
     if args.device is not None:
         env_cfg.sim.device = args.device
-    if args.course is not None:
-        env_cfg.course = args.course
+    # PR 3 round-1 fix (review finding 4): no post-hoc `env_cfg.course` patch.
+    # The course is selected by VEHICLE_RL_EXPERIMENT_YAML (set unconditionally
+    # above when --course is supplied), so the factory builds a fully
+    # consistent cfg at registry-make time. Overwriting cfg.course here would
+    # break the radius / target_speed / course_ds invariants for legacy
+    # courses without dedicated experiment YAMLs (s_curve / dlc / lemniscate);
+    # those need their own experiment YAMLs in PR 4.
     if args.random_path_cfg is not None:
         env_cfg.random_path_cfg_path = args.random_path_cfg
     if args.max_iterations is not None:

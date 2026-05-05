@@ -104,9 +104,11 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     steering_only: bool = MISSING
     pi_kp: float = MISSING
     pi_ki: float = MISSING
+    pi_integral_max: float = MISSING
 
     # --- Reset distribution ---
     random_reset_along_path: bool = MISSING
+    warm_start_velocity: bool = MISSING
 
     # --- Reward weights ---
     rew_progress: float = MISSING
@@ -117,13 +119,37 @@ class TrackingEnvCfg(DirectRLEnvCfg):
     rew_pinion_rate: float = MISSING
     rew_jerk: float = MISSING
     rew_termination: float = MISSING
+    progress_clamp_low: float = MISSING
+    progress_clamp_high: float = MISSING
 
     # --- Termination thresholds ---
     max_lateral_error: float = MISSING       # m
     max_roll_rad: float = MISSING            # rad
 
+    # --- Diagnostics flags (gate logging accumulation/emission) ---
+    log_reward_terms: bool = MISSING
+    log_state_action_terms: bool = MISSING
+    log_projection_health: bool = MISSING
+
     # --- Initial pose ---
     cog_z: float = MISSING
+
+    # --- Observation layout (from configs/envs/tracking.yaml `spaces.observation`) ---
+    obs_imu_fields: list = MISSING
+    obs_include_pinion_angle: bool = MISSING
+    obs_include_path_errors: bool = MISSING
+    obs_include_plan: bool = MISSING
+    obs_include_world_pose: bool = MISSING
+
+    # --- Resolved YAML bundles (for dynamics-side simulator construction) ---
+    # `dynamics_kwargs` is the full kwarg dict produced by
+    # `make_simulator_kwargs(dynamics_bundle)` plus `steering_ratio` from the
+    # vehicle bundle. Carrying it on the cfg lets `TrackingEnv.__init__`
+    # construct `VehicleSimulator` directly from YAML values, eliminating the
+    # previous hard-coded literals (a_front=2.7/2.0, lag=0.05/0.20/0.07,
+    # cornering_stiffness=60000.0, etc.).
+    dynamics_kwargs: dict = MISSING
+    a_front: float = MISSING
 
 
 class TrackingEnv(DirectRLEnv):
@@ -151,32 +177,17 @@ class TrackingEnv(DirectRLEnv):
         # VehicleSimulator wraps the Articulation we registered in _setup_scene.
         # Constructing it after super().__init__() so SimulationContext + scene
         # are fully initialized.
-        # PR 3: route through make_simulator_kwargs(adapter)
-        # PR 2 round-1 fix: pass the full new VehicleSimulator kwarg set inline
-        # so the env keeps booting at PR 2 merge. Values mirror
-        # configs/dynamics/linear_friction_circle_flat.yaml +
-        # configs/vehicles/sedan.yaml so behaviour is unchanged from the
-        # implicit defaults the simulator used to carry.
+        # PR 3 round-1 fix (review finding 1): the dynamics kwargs come from
+        # the YAML via `make_simulator_kwargs(dynamics_bundle)` (with
+        # `steering_ratio` and `a_front` taken from the vehicle bundle).
+        # `TrackingEnvCfg.dynamics_kwargs` carries the full dict so changing
+        # configs/dynamics/*.yaml actually changes the simulator.
+        sim_kwargs = dict(self.cfg.dynamics_kwargs)
         self.vsim = VehicleSimulator(
             self.sim, self.sedan,
             steering_ratio=STEERING_RATIO,
-            tau_steer=0.05,
-            tau_drive=0.20,
-            tau_brake=0.07,
-            actuator_initial_value=0.0,
-            cornering_stiffness=60000.0,
-            eps_vlong=0.01,
-            fx_split_accel="rear",
-            fx_split_brake="four_wheel",
-            a_front=2.7 / 2.0,        # WHEELBASE / 2.0 (symmetric)
-            z_drift_kp=50000.0,
-            z_drift_kd=5000.0,
-            k_roll=80000.0,
-            c_roll=8000.0,
-            k_pitch=80000.0,
-            c_pitch=8000.0,
-            mu_default=self.cfg.mu_default,
-            gravity=9.81,
+            a_front=float(self.cfg.a_front),
+            **sim_kwargs,
         )
 
         # Course is shared across envs by default (broadcast Path(N, M)).
@@ -264,6 +275,7 @@ class TrackingEnv(DirectRLEnv):
             self._pi_speed = PIDSpeedController(
                 num_envs=self.num_envs, dt=self._control_dt,
                 kp=self.cfg.pi_kp, ki=self.cfg.pi_ki,
+                integral_max=float(self.cfg.pi_integral_max),
                 a_x_min=self.cfg.a_x_min, a_x_max=self.cfg.a_x_max,
                 device=self.device,
             )
@@ -624,7 +636,12 @@ class TrackingEnv(DirectRLEnv):
         delta_s = torch.maximum(-cap, torch.minimum(cap, delta_s))
         target_v = self._last_target_speed.clamp(min=1e-3)
         progress_norm = delta_s / (target_v * self._control_dt)
-        self._last_progress_norm = progress_norm.clamp(-1.0, 1.0)
+        # PR 3 round-1 fix (review finding 3): progress clamp range comes from
+        # the YAML (`reward.progress_clamp`) instead of being hardcoded.
+        self._last_progress_norm = progress_norm.clamp(
+            float(self.cfg.progress_clamp_low),
+            float(self.cfg.progress_clamp_high),
+        )
         self._s_prev = s_proj.detach().clone()
 
     def _get_dones(self) -> tuple[Tensor, Tensor]:
@@ -690,28 +707,35 @@ class TrackingEnv(DirectRLEnv):
         )
         r_term = self.cfg.rew_termination * self._last_terminated.to(r_progress.dtype)
 
-        # Accumulate per-env per-term sums (flushed at episode end).
-        self._episode_sums["progress"] += r_progress
-        self._episode_sums["alive"] += r_alive
-        self._episode_sums["lateral"] += r_lateral
-        self._episode_sums["heading"] += r_heading
-        self._episode_sums["speed"] += r_speed
-        self._episode_sums["action_rate"] += r_rate
-        self._episode_sums["termination"] += r_term
+        # PR 3 round-1 fix (review finding 3): each diagnostic family is gated
+        # by its YAML flag. Accumulators stay zeroed when their flag is False
+        # so the corresponding `Episode_*` log entries vanish from
+        # `extras["log"]` (the emission path in `_reset_idx` only iterates
+        # over `_episode_*_sums`, which we gate at construction).
+        if self.cfg.log_reward_terms:
+            self._episode_sums["progress"] += r_progress
+            self._episode_sums["alive"] += r_alive
+            self._episode_sums["lateral"] += r_lateral
+            self._episode_sums["heading"] += r_heading
+            self._episode_sums["speed"] += r_speed
+            self._episode_sums["action_rate"] += r_rate
+            self._episode_sums["termination"] += r_term
 
         # Diagnostic accumulators (item F). lat/hdg as |·| so sign-cancellation
         # on a symmetric course doesn't hide jitter; vx kept signed so the
         # mean is the average forward speed; pinion in [-1, 1] action space
         # so the magnitude is decimation-independent.
-        self._episode_diag_sums["Episode_State/lat_err_abs"] += lat_err.abs()
-        self._episode_diag_sums["Episode_State/heading_err_abs"] += hdg_err.abs()
-        self._episode_diag_sums["Episode_State/vx"] += obs.vx
-        self._episode_diag_sums["Episode_Action/pinion_abs"] += self._current_action[:, 0].abs()
-        self._episode_diag_sums["Episode_Action/pinion_rate_abs"] += rate_pinion.abs()
-        self._episode_diag_sums["Episode_Progress/progress_norm"] += self._last_progress_norm
-        self._episode_diag_sums["Episode_PathProj/idx_jump_abs"] += self._last_idx_jump_abs
-        self._episode_diag_sums["Episode_PathProj/idx_jump_violation_rate"] += \
-            self._last_idx_jump_violation
+        if self.cfg.log_state_action_terms:
+            self._episode_diag_sums["Episode_State/lat_err_abs"] += lat_err.abs()
+            self._episode_diag_sums["Episode_State/heading_err_abs"] += hdg_err.abs()
+            self._episode_diag_sums["Episode_State/vx"] += obs.vx
+            self._episode_diag_sums["Episode_Action/pinion_abs"] += self._current_action[:, 0].abs()
+            self._episode_diag_sums["Episode_Action/pinion_rate_abs"] += rate_pinion.abs()
+            self._episode_diag_sums["Episode_Progress/progress_norm"] += self._last_progress_norm
+        if self.cfg.log_projection_health:
+            self._episode_diag_sums["Episode_PathProj/idx_jump_abs"] += self._last_idx_jump_abs
+            self._episode_diag_sums["Episode_PathProj/idx_jump_violation_rate"] += \
+                self._last_idx_jump_violation
 
         # One step's worth of reward accumulated -- bump the per-env counter
         # used as the per-step normalization denominator in `_reset_idx`.
@@ -721,40 +745,54 @@ class TrackingEnv(DirectRLEnv):
         return r_progress + r_alive + r_lateral + r_heading + r_speed + r_rate + r_term
 
     def _get_observations(self) -> dict:
-        """39-dim path-relative observation.
+        """Path-relative observation. Layout driven by `spaces.observation` YAML.
 
-        Layout (concatenated along dim=-1):
+        PR 3 round-1 fix (review finding 2): the tensor is built from the
+        YAML's enabled fields (`imu_fields`, `include_pinion_angle`,
+        `include_path_errors`, `include_plan`, `include_world_pose`) and the
+        resulting width matches `_derived_observation_space(env_bundle)`. A
+        runtime assertion at the end of this method guards against drift.
+
+        Layout (when all flags True with default `imu_fields = [vx, yaw_rate,
+        ax, ay, roll, pitch]`, `plan_K=10`, `include_world_pose=False`):
           [0:6]   IMU: vx, yaw_rate, ax, ay, roll, pitch
-          [6]     pinion_angle (steering-column encoder)
+          [6]     pinion_angle
           [7:9]   lateral_error, heading_error
-          [9:39]  plan_xyv flattened: x[0..K-1], y[0..K-1], v[0..K-1]
-
-        World-frame absolute pose (`pos_xyz`, `yaw`) is intentionally
-        omitted from the policy view (see docs/phase3_training_review.md
-        item 7 and types.py module docstring). It remains accessible via
-        `self._last_state_gt` for metrics + termination checks.
-
-        Recomputed here (post-reset) so envs that just reset return
-        observations consistent with their fresh pose, not their pre-reset
-        cached state. Pure projection -- does NOT advance `_s_prev`, so
-        extra observation calls (debug / render / wrappers) never corrupt
-        the progress reward (review item A).
+          [9:39]  plan_xyv flattened
         """
         self._compute_path_state()
         obs_struct = self._last_obs
 
-        obs = torch.cat([
-            obs_struct.vx.unsqueeze(-1),
-            obs_struct.yaw_rate.unsqueeze(-1),
-            obs_struct.ax.unsqueeze(-1),
-            obs_struct.ay.unsqueeze(-1),
-            obs_struct.roll.unsqueeze(-1),
-            obs_struct.pitch.unsqueeze(-1),
-            obs_struct.pinion_angle.unsqueeze(-1),
-            self._last_lat_err.unsqueeze(-1),
-            self._last_hdg_err.unsqueeze(-1),
-            self._last_plan.x, self._last_plan.y, self._last_plan.v,
-        ], dim=-1)
+        parts: list[Tensor] = []
+        # IMU scalar fields (variable list driven by YAML).
+        for fname in self.cfg.obs_imu_fields:
+            v = getattr(obs_struct, fname)
+            parts.append(v.unsqueeze(-1))
+        if self.cfg.obs_include_pinion_angle:
+            parts.append(obs_struct.pinion_angle.unsqueeze(-1))
+        if self.cfg.obs_include_path_errors:
+            parts.append(self._last_lat_err.unsqueeze(-1))
+            parts.append(self._last_hdg_err.unsqueeze(-1))
+        if self.cfg.obs_include_plan:
+            parts.append(self._last_plan.x)
+            parts.append(self._last_plan.y)
+            parts.append(self._last_plan.v)
+        if self.cfg.obs_include_world_pose:
+            # x, y, yaw of the vehicle in env-local frame (env_origins removed
+            # in `_compute_path_state`). Yaw comes from the most recent
+            # ground-truth state.
+            parts.append(self._last_pos_local[:, 0:1])
+            parts.append(self._last_pos_local[:, 1:2])
+            parts.append(self._last_state_gt.rpy[:, 2:3])
+
+        obs = torch.cat(parts, dim=-1)
+        # Runtime gate: if the YAML-derived `cfg.observation_space` and the
+        # actual tensor width disagree, the gym Box and the policy's input
+        # dim will desync silently. Raise here so the failure is visible.
+        assert obs.shape[-1] == int(self.cfg.observation_space), (
+            f"obs shape {obs.shape} != cfg.observation_space "
+            f"{int(self.cfg.observation_space)}"
+        )
         return {"policy": obs}
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -782,14 +820,35 @@ class TrackingEnv(DirectRLEnv):
         # because rsl_rl's `init_at_random_ep_len=True` desyncs the framework
         # counter from our sums on iter 0; see `_sum_step_count` setup.
         ep_len = self._sum_step_count[env_ids_t].clamp(min=1).float()
-        for key, sums in self._episode_sums.items():
-            log_extras[f"Episode_Reward/{key}"] = (
-                sums[env_ids_t] / ep_len.to(sums.dtype)
-            ).mean()
-            sums[env_ids_t] = 0.0
+        # PR 3 round-1 fix (review finding 3): emission gated by YAML flags.
+        # When `log_reward_terms=False` the per-term sums never accumulated
+        # (see `_get_rewards`); we additionally skip the emission here so the
+        # `Episode_Reward/*` keys do not appear in `extras["log"]` at all.
+        if self.cfg.log_reward_terms:
+            for key, sums in self._episode_sums.items():
+                log_extras[f"Episode_Reward/{key}"] = (
+                    sums[env_ids_t] / ep_len.to(sums.dtype)
+                ).mean()
+                sums[env_ids_t] = 0.0
         # Diagnostic state / action / progress means (item F). Same
         # per-step normalization as the reward terms above.
+        _state_action_keys = {
+            "Episode_State/lat_err_abs",
+            "Episode_State/heading_err_abs",
+            "Episode_State/vx",
+            "Episode_Action/pinion_abs",
+            "Episode_Action/pinion_rate_abs",
+            "Episode_Progress/progress_norm",
+        }
+        _projection_keys = {
+            "Episode_PathProj/idx_jump_abs",
+            "Episode_PathProj/idx_jump_violation_rate",
+        }
         for key, sums in self._episode_diag_sums.items():
+            if key in _state_action_keys and not self.cfg.log_state_action_terms:
+                continue
+            if key in _projection_keys and not self.cfg.log_projection_health:
+                continue
             log_extras[key] = (sums[env_ids_t] / ep_len.to(sums.dtype)).mean()
             sums[env_ids_t] = 0.0
         self._sum_step_count[env_ids_t] = 0
@@ -914,10 +973,14 @@ class TrackingEnv(DirectRLEnv):
         # (tau_drive=200ms) physically can't correct in <1s. For random_long
         # the per-segment v varies across the path, so the local v[idx]
         # gives a closer match to what the policy / internal PI will target.
-        vel_world = torch.zeros((n_reset, 6), device=self.device)
-        vel_world[:, 0] = torch.cos(yaw) * v_warmstart                   # vx_world
-        vel_world[:, 1] = torch.sin(yaw) * v_warmstart                   # vy_world
-        self.sedan.write_root_velocity_to_sim(vel_world, env_ids=env_ids_t)
+        # PR 3 round-1 fix (review finding 3): gated by `reset.warm_start_velocity`.
+        # When False, the simulator's reset leaves vehicles at zero velocity
+        # (path[0] start pose). Useful for ablations / classical eval.
+        if self.cfg.warm_start_velocity:
+            vel_world = torch.zeros((n_reset, 6), device=self.device)
+            vel_world[:, 0] = torch.cos(yaw) * v_warmstart                   # vx_world
+            vel_world[:, 1] = torch.sin(yaw) * v_warmstart                   # vy_world
+            self.sedan.write_root_velocity_to_sim(vel_world, env_ids=env_ids_t)
 
         # Reset internal state for these envs.
         self._last_action[env_ids_t] = 0.0
