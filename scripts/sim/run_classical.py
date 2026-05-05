@@ -13,17 +13,28 @@ Outputs per run:
     metrics/classical_<course>_mu<m>_v<v>.json     -- 7-metric Phase 2 sanity report
     videos/classical_<course>_mu<m>_v<v>.mp4       -- ground-truth visualisation
 
+PR 2 (YAML refactor): vehicle / dynamics / course are now sourced from
+configs/{vehicles, dynamics, courses}/*.yaml via
+`vehicle_rl.config.isaac_adapter`. The CLI (`--course`, `--mu`,
+`--target_speed`, `--radius`, `--pid_kp`, ...) is intentionally kept the
+same in PR 2; PR 4 replaces it with `--config <experiment YAML>`.
+
 Run from repository root (venv python):
     PY="/c/work/isaac/env_isaaclab/Scripts/python.exe"
     $PY scripts/sim/run_classical.py --course circle --mu 0.9 --target_speed 10 --duration 25 --headless
 """
 import argparse
+import copy
 import csv
 import math
 import os
 import sys
+from pathlib import Path as _PyPath
 
 from isaaclab.app import AppLauncher
+
+# Repo root is two levels up from this script (scripts/sim/run_classical.py).
+_REPO_ROOT = _PyPath(__file__).resolve().parents[2]
 
 parser = argparse.ArgumentParser(description="Phase 2 classical baseline driver")
 parser.add_argument("--course", choices=["circle", "lemniscate", "s_curve", "dlc"],
@@ -69,47 +80,70 @@ from isaaclab.assets import Articulation
 from isaaclab.sim import SimulationContext
 from isaaclab.sensors import CameraCfg, Camera
 
-from vehicle_rl.assets import (
-    SEDAN_CFG, COG_Z_DEFAULT, WHEELBASE, STEERING_RATIO,
+from vehicle_rl.config.isaac_adapter import (
+    build_path as adapter_build_path,
+    make_sedan_cfg,
+    make_simulator_kwargs,
 )
+from vehicle_rl.config.loader import load_yaml_strict
 from vehicle_rl.controller import PurePursuitController, PIDSpeedController
 from vehicle_rl.envs import VehicleAction, build_observation
 from vehicle_rl.envs.simulator import VehicleSimulator
-from vehicle_rl.planner import circle_path, lemniscate_path, s_curve_path, dlc_path
 from vehicle_rl.utils import (
     ProgressAccumulator, summarize_trajectory, write_metrics_json,
 )
 
 
-GRAVITY = 9.81
+# These constants describe the run-classical pipeline itself (lookahead window
+# size for the Plan; off-track threshold used in the 7-metric report). They
+# are not vehicle / dynamics / course parameters and stay in code per the
+# PR 2 plan ("## 基本方針 / No Code Defaults" -- formula constants OK).
 LOOKAHEAD_DS = 1.0   # arc-length spacing of Plan window [m]
 PLAN_K = 20          # number of lookahead points (covers ~ v_max * 1s preview)
 OFF_TRACK_THRESHOLD_M = 1.0   # |lateral_error| above this counts as off-track
 PROJ_SEARCH_RADIUS = 80       # local-window half-width for Path.project (samples)
 
 
-def build_path(args, num_envs, device):
-    """Construct the requested course as a Path."""
+def _course_yaml_path(course: str) -> _PyPath:
+    return _REPO_ROOT / "configs" / "courses" / f"{course}.yaml"
+
+
+def _vehicle_yaml_path() -> _PyPath:
+    return _REPO_ROOT / "configs" / "vehicles" / "sedan.yaml"
+
+
+def _dynamics_yaml_path() -> _PyPath:
+    return _REPO_ROOT / "configs" / "dynamics" / "linear_friction_circle_flat.yaml"
+
+
+def _course_bundle_with_cli_overrides(args) -> dict:
+    """Load the course YAML and apply CLI overrides where the legacy CLI
+    flags are still supported (PR 2: keep CLI shape; PR 4: drop CLI).
+
+    The resulting bundle is what gets fed to `adapter_build_path`.
+    """
+    bundle = load_yaml_strict(_course_yaml_path(args.course))
+    bundle = copy.deepcopy(bundle)
+    bundle["target_speed_mps"] = float(args.target_speed)
     if args.course == "circle":
-        return circle_path(
-            radius=args.radius, target_speed=args.target_speed,
-            num_envs=num_envs, ds=0.2, device=device,
-        )
+        bundle["radius_m"] = float(args.radius)
     elif args.course == "lemniscate":
-        return lemniscate_path(
-            a=args.lemniscate_a, target_speed=args.target_speed,
-            num_envs=num_envs, ds=0.2, device=device,
-        )
+        bundle["a_m"] = float(args.lemniscate_a)
     elif args.course == "s_curve":
-        return s_curve_path(
-            length=args.s_length, amplitude=args.s_amplitude,
-            target_speed=args.target_speed, num_envs=num_envs, ds=0.2, device=device,
-        )
-    elif args.course == "dlc":
-        return dlc_path(
-            target_speed=args.target_speed, num_envs=num_envs, ds=0.2, device=device,
-        )
-    raise ValueError(f"unknown course {args.course}")
+        bundle["length_m"] = float(args.s_length)
+        bundle["amplitude_m"] = float(args.s_amplitude)
+    return bundle
+
+
+def build_path(args, num_envs, device):
+    """Construct the requested course as a Path via the YAML adapter.
+
+    The CLI flags `--target_speed`, `--radius`, `--lemniscate_a`,
+    `--s_length`, `--s_amplitude` overlay the YAML bundle (legacy CLI
+    behaviour preserved during PR 2).
+    """
+    course_bundle = _course_bundle_with_cli_overrides(args)
+    return adapter_build_path(course_bundle, num_envs=num_envs, device=device)
 
 
 def camera_view_for_course(course):
@@ -125,13 +159,14 @@ def camera_view_for_course(course):
     return (0.0, -50.0, 30.0), (0.0, 0.0, 0.0)
 
 
-def design_scene(record_video):
+def design_scene(record_video, vehicle_bundle):
     sim_utils.GroundPlaneCfg().func("/World/defaultGroundPlane", sim_utils.GroundPlaneCfg())
     sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75)).func(
         "/World/Light", sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
     )
-    sedan_cfg = SEDAN_CFG.copy()
-    sedan_cfg.prim_path = "/World/Sedan"
+    # Build the ArticulationCfg from the resolved vehicle bundle (PR 2).
+    sedan_cfg = make_sedan_cfg(vehicle_bundle).copy()
+    sedan_cfg.prim_path = vehicle_bundle["asset"]["prim_path_single"]
     sedan = Articulation(cfg=sedan_cfg)
 
     cam = None
@@ -175,15 +210,27 @@ def yaw_to_quat_wxyz(yaw):
 
 def main():
     device = args_cli.device
+
+    # Resolve the canonical vehicle / dynamics bundles. These power the
+    # ArticulationCfg, the VehicleSimulator kwargs, and the Pure Pursuit
+    # gain (wheelbase / steering ratio).
+    vehicle_bundle = load_yaml_strict(_vehicle_yaml_path())
+    dynamics_bundle = load_yaml_strict(_dynamics_yaml_path())
+
+    gravity = float(dynamics_bundle["gravity_mps2"])
+    cog_z = float(vehicle_bundle["geometry"]["cog_z_m"])
+    wheelbase = float(vehicle_bundle["geometry"]["wheelbase_m"])
+    steering_ratio = float(vehicle_bundle["steering"]["steering_ratio"])
+
     sim_cfg = sim_utils.SimulationCfg(
-        device=device, dt=1.0 / 200.0, gravity=(0.0, 0.0, -GRAVITY),
+        device=device, dt=1.0 / 200.0, gravity=(0.0, 0.0, -gravity),
     )
     sim = SimulationContext(sim_cfg)
     eye, target = camera_view_for_course(args_cli.course)
     sim.set_camera_view(list(eye), list(target))
 
     record_video = not args_cli.no_video
-    sedan, cam = design_scene(record_video=record_video)
+    sedan, cam = design_scene(record_video=record_video, vehicle_bundle=vehicle_bundle)
     sim.reset()
 
     if cam is not None:
@@ -204,17 +251,23 @@ def main():
     start_pos, start_yaw = path.start_pose
     qw, qx, qy, qz = yaw_to_quat_wxyz(float(start_yaw[0].item()))
     initial_pose = torch.tensor(
-        [[float(start_pos[0, 0].item()), float(start_pos[0, 1].item()), COG_Z_DEFAULT,
+        [[float(start_pos[0, 0].item()), float(start_pos[0, 1].item()), cog_z,
           qw, qx, qy, qz]],
         device=device,
     )
 
-    vsim = VehicleSimulator(sim, sedan, mu_default=args_cli.mu)
+    # Build VehicleSimulator kwargs from the dynamics YAML, then overlay the
+    # vehicle's steering_ratio (lives in vehicle_bundle, not dynamics) and
+    # the CLI mu (legacy --mu flag still supported in PR 2; PR 4 removes it).
+    sim_kwargs = make_simulator_kwargs(dynamics_bundle)
+    sim_kwargs["steering_ratio"] = steering_ratio
+    sim_kwargs["mu_default"] = float(args_cli.mu)
+    vsim = VehicleSimulator(sim, sedan, **sim_kwargs)
     state_gt = vsim.reset(initial_pose=initial_pose)
 
     # Controllers
     pp = PurePursuitController(
-        wheelbase=WHEELBASE, steering_ratio=STEERING_RATIO, pinion_max=vsim.pinion_max,
+        wheelbase=wheelbase, steering_ratio=steering_ratio, pinion_max=vsim.pinion_max,
         lookahead_min=args_cli.pp_lookahead_min,
         lookahead_gain=args_cli.pp_lookahead_gain,
         lookahead_ds=LOOKAHEAD_DS,
@@ -298,7 +351,7 @@ def main():
             math.degrees(float(state_gt.rpy[0, 0])),
             float(lat_err_log[0]), math.degrees(float(hdg_err_log[0])),
             float(s_proj_log[0]),
-            float(pinion_target[0] / STEERING_RATIO),
+            float(pinion_target[0] / steering_ratio),
             float(pinion_target[0]),
             float(a_x_target[0]),
             float(state_gt.delta_actual[0]),

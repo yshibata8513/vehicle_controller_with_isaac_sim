@@ -31,7 +31,6 @@ from isaaclab.sim import SimulationContext
 from vehicle_rl.assets import (
     COG_Z_DEFAULT,
     DELTA_MAX_RAD,
-    STEERING_RATIO,
     TOTAL_MASS,
     TRACK,
     WHEELBASE,
@@ -83,24 +82,24 @@ class VehicleSimulator:
         *,
         device: torch.device | str | None = None,
         # Steering chain (pinion -> tire angle)
-        steering_ratio: float = STEERING_RATIO,
+        steering_ratio: float,
         # First-order lag time constants
-        tau_steer: float = 0.05,
-        tau_drive: float = 0.20,
-        tau_brake: float = 0.07,
+        tau_steer: float,
+        tau_drive: float,
+        tau_brake: float,
         # Tire model
-        cornering_stiffness: float = 60_000.0,
+        cornering_stiffness: float,
         # Static normal load (z-drift PD just suppresses integration drift)
-        z_drift_kp: float = 50_000.0,
-        z_drift_kd: float = 5_000.0,
+        z_drift_kp: float,
+        z_drift_kd: float,
         # Virtual roll/pitch damper (yaw is intentionally undamped)
-        k_roll: float = 80_000.0,
-        c_roll: float = 8_000.0,
-        k_pitch: float = 80_000.0,
-        c_pitch: float = 8_000.0,
+        k_roll: float,
+        c_roll: float,
+        k_pitch: float,
+        c_pitch: float,
         # Initial mu (callers can override via the `mu` property after construction)
-        mu_default: float = 0.9,
-        gravity: float = 9.81,
+        mu_default: float,
+        gravity: float,
     ):
         self.sim = sim
         self.sedan = sedan

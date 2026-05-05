@@ -116,11 +116,11 @@ def _broadcast_to_path(
 
 def circle_path(
     *,
-    radius: float = 30.0,
-    target_speed: float = 15.0,
-    num_envs: int = 1,
-    ds: float = 0.2,
-    device: torch.device | str = "cpu",
+    radius: float,
+    target_speed: float,
+    num_envs: int,
+    ds: float,
+    device: torch.device | str,
 ) -> Path:
     """Closed CCW circle of given radius, centered at origin.
 
@@ -148,12 +148,12 @@ def circle_path(
 
 def lemniscate_path(
     *,
-    a: float = 25.0,
-    target_speed: float = 8.0,
-    num_envs: int = 1,
-    ds: float = 0.2,
-    n_raw: int = 4096,
-    device: torch.device | str = "cpu",
+    a: float,
+    target_speed: float,
+    num_envs: int,
+    ds: float,
+    n_raw: int,
+    device: torch.device | str,
 ) -> Path:
     """Lissajous figure-eight: x = a*sin(2t), y = a*sin(t), t in [0, 2*pi].
 
@@ -183,14 +183,14 @@ def lemniscate_path(
 
 def s_curve_path(
     *,
-    length: float = 100.0,
-    amplitude: float = 5.0,
-    n_cycles: float = 1.0,
-    target_speed: float = 12.0,
-    num_envs: int = 1,
-    ds: float = 0.2,
-    n_raw: int = 4096,
-    device: torch.device | str = "cpu",
+    length: float,
+    amplitude: float,
+    n_cycles: float,
+    target_speed: float,
+    num_envs: int,
+    ds: float,
+    n_raw: int,
+    device: torch.device | str,
 ) -> Path:
     """Sinusoidal S-curve: y = amplitude * sin(2*pi*n_cycles*x/length),
     x in [0, length].
@@ -211,12 +211,12 @@ def s_curve_path(
 
 def dlc_path(
     *,
-    target_speed: float = 13.0,
-    num_envs: int = 1,
-    ds: float = 0.2,
-    n_raw: int = 4096,
-    lane_offset: float = 3.5,
-    device: torch.device | str = "cpu",
+    target_speed: float,
+    num_envs: int,
+    ds: float,
+    n_raw: int,
+    lane_offset: float,
+    device: torch.device | str,
 ) -> Path:
     """ISO 3888-2 Double Lane Change (simplified geometry).
 

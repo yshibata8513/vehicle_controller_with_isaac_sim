@@ -23,9 +23,14 @@ Conventions:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path as _PyPath
 from typing import TYPE_CHECKING
 
 from torch import Tensor
+
+from vehicle_rl import VEHICLE_RL_ROOT
+from vehicle_rl.config.isaac_adapter import make_action_limits
+from vehicle_rl.config.loader import load_yaml_strict
 
 if TYPE_CHECKING:
     from vehicle_rl.planner.plan import Plan
@@ -34,8 +39,19 @@ if TYPE_CHECKING:
 # Action ranges (used by controllers and gym Box construction in Phase 3).
 # `pinion_target` range is computed in the action term factory from
 # DELTA_MAX_RAD * STEERING_RATIO; we don't hard-code it here.
-A_X_TARGET_MIN = -5.0   # m/s^2 (full braking)
-A_X_TARGET_MAX = +3.0   # m/s^2 (moderate accel; matches PLAN.md Phase 3)
+#
+# PR 2 (YAML refactor): the literal numeric bounds now live in
+# configs/dynamics/linear_friction_circle_flat.yaml and are pulled in at
+# import time via the adapter. The names are kept as module-level
+# constants for backwards compatibility with tracking_env.py (PR 3 scope);
+# new consumers should call `make_action_limits(dynamics_bundle)` from the
+# adapter directly with their experiment's resolved dynamics bundle.
+_DEFAULT_DYNAMICS_YAML = (
+    _PyPath(VEHICLE_RL_ROOT) / "configs" / "dynamics" / "linear_friction_circle_flat.yaml"
+)
+_A_X_MIN, _A_X_MAX = make_action_limits(load_yaml_strict(_DEFAULT_DYNAMICS_YAML))
+A_X_TARGET_MIN = _A_X_MIN
+A_X_TARGET_MAX = _A_X_MAX
 
 
 @dataclass
